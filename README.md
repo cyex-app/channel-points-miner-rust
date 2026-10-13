@@ -25,6 +25,8 @@ The UI is protected by a login token. It's generated on the first start, printed
 browser stays logged in. If the token leaks, click **Regenerate login token** under *Web access* in the UI: you
 get a new token, and every other browser is logged out. Deleting `web_token` and restarting also makes a new one.
 Scripts can send the token as `Authorization: Bearer <token>`.
+The UI gets live updates over Server-Sent Events from `/api/stream` (`status`, `log-init` with the last 50 log
+lines, then one `log` per new line); `/api/status` returns the same state as a single JSON snapshot.
 
 ### Channels
 

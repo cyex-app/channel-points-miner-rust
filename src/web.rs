@@ -1,10 +1,12 @@
 //! Small web UI + JSON API to watch the miner and add/remove channels.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
+    convert::Infallible,
     fs,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, RwLock},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -12,12 +14,16 @@ use axum::{
     extract::{Path, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::{delete, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::broadcast::{self, error::RecvError};
 
 use crate::{
     auth::LoginPrompt,
@@ -93,6 +99,7 @@ impl WebAuth {
 pub async fn serve(state: Arc<AppState>, host: &str, port: u16) -> Result<()> {
     let protected = Router::new()
         .route("/api/status", get(status))
+        .route("/api/stream", get(stream))
         .route("/api/streamers", post(add_streamer))
         .route("/api/streamers/order", put(reorder))
         .route("/api/streamers/:id", delete(remove_streamer))
@@ -204,7 +211,8 @@ impl StreamerView {
             title: st.stream.title.clone(),
             game: st.stream.game.as_ref().map(|g| g.display_name.clone()),
             viewers: st.stream.viewers_count,
-            minutes_watched: st.stream.minute_watched,
+            // Whole minutes, so the live stream only sends an update when the number shown changes.
+            minutes_watched: st.stream.minute_watched.floor(),
             history: st.history.clone(),
         }
     }
@@ -217,19 +225,21 @@ struct Status {
     login_prompt: Option<LoginPrompt>,
     started_at: Option<f64>,
     streamers: Vec<StreamerView>,
-    events: Vec<LogEvent>,
+    /// Only in `/api/status`; the live stream sends events separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<Vec<LogEvent>>,
 }
 
-async fn status(State(state): State<Arc<AppState>>) -> Json<Status> {
+fn snapshot(state: &AppState, with_events: bool) -> Status {
     let login_prompt = state.login_prompt.lock().unwrap().clone();
-    Json(match state.miner.get() {
+    match state.miner.get() {
         Some(miner) => Status {
             ready: true,
             user: Some(miner.twitch.creds.login.clone()),
             login_prompt,
             started_at: Some(miner.started_at),
             streamers: miner.streamers().iter().map(|s| StreamerView::new(s)).collect(),
-            events: miner.events(),
+            events: with_events.then(|| miner.events()),
         },
         None => Status {
             ready: false,
@@ -237,9 +247,83 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Status> {
             login_prompt,
             started_at: None,
             streamers: Vec::new(),
-            events: Vec::new(),
+            events: with_events.then(Vec::new),
         },
-    })
+    }
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> Json<Status> {
+    Json(snapshot(&state, true))
+}
+
+/// State of one `/api/stream` connection.
+struct StreamConn {
+    state: Arc<AppState>,
+    /// The last status sent, to only send changes.
+    last_status: String,
+    events: Option<broadcast::Receiver<LogEvent>>,
+    tick: tokio::time::Interval,
+    queued: VecDeque<Event>,
+}
+
+async fn next_event(rx: &mut Option<broadcast::Receiver<LogEvent>>) -> Result<LogEvent, RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Server-Sent Events for the web UI:
+/// - `status`: the dashboard state (like `/api/status` without events), sent on connect and when it changes
+/// - `log-init`: the recent log lines, sent once the miner is running (and again if the client fell behind)
+/// - `log`: one new log line
+async fn stream(State(state): State<Arc<AppState>>) -> Response {
+    let mut tick = tokio::time::interval(Duration::from_secs(2));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let conn = StreamConn { state, last_status: String::new(), events: None, tick, queued: VecDeque::new() };
+
+    let events = futures_util::stream::unfold(conn, |mut c| async move {
+        loop {
+            if let Some(event) = c.queued.pop_front() {
+                return Some((Ok::<_, Infallible>(event), c));
+            }
+            if c.events.is_none() {
+                if let Some(miner) = c.state.miner.get() {
+                    let (recent, rx) = miner.subscribe_events();
+                    c.events = Some(rx);
+                    let data = serde_json::to_string(&recent).unwrap_or_default();
+                    c.queued.push_back(Event::default().event("log-init").data(data));
+                    continue;
+                }
+            }
+            tokio::select! {
+                _ = c.tick.tick() => {
+                    let status = serde_json::to_string(&snapshot(&c.state, false)).unwrap_or_default();
+                    if status != c.last_status {
+                        c.last_status = status.clone();
+                        return Some((Ok(Event::default().event("status").data(status)), c));
+                    }
+                }
+                event = next_event(&mut c.events) => match event {
+                    Ok(event) => {
+                        let data = serde_json::to_string(&event).unwrap_or_default();
+                        return Some((Ok(Event::default().event("log").data(data)), c));
+                    }
+                    // Fell behind: start over with a fresh `log-init`.
+                    Err(RecvError::Lagged(_)) => c.events = None,
+                    Err(RecvError::Closed) => return None,
+                },
+            }
+        }
+    });
+
+    // Keep-alive comments stop proxies (e.g. Cloudflare) from closing an idle stream, and
+    // `X-Accel-Buffering: no` stops nginx from buffering it.
+    (
+        [("X-Accel-Buffering", "no")],
+        Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))),
+    )
+        .into_response()
 }
 
 fn error(status: StatusCode, message: impl ToString) -> Response {

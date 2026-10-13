@@ -7,7 +7,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::{sync::mpsc, time::Instant};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::Instant,
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -24,7 +27,8 @@ use crate::{
 };
 
 const MAX_WATCHING: usize = 2;
-const MAX_EVENTS: usize = 300;
+/// Recent events kept for web UI clients that connect later.
+const MAX_EVENTS: usize = 50;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEvent {
@@ -40,6 +44,8 @@ pub struct Miner {
     pubsub: PubSubPool,
     chat: ChatManager,
     events: Mutex<VecDeque<LogEvent>>,
+    /// New events, pushed to connected web UI clients.
+    events_tx: broadcast::Sender<LogEvent>,
     adding: Mutex<HashSet<String>>,
     pub started_at: f64,
 }
@@ -65,6 +71,7 @@ impl Miner {
             pubsub: PubSubPool::new(token, pubsub_messages),
             chat,
             events: Mutex::new(VecDeque::new()),
+            events_tx: broadcast::channel(256).0,
             adding: Mutex::new(HashSet::new()),
             started_at: now(),
         }
@@ -74,8 +81,11 @@ impl Miner {
     pub fn event(&self, text: impl Into<String>) {
         let text = text.into();
         info!("{text}");
+        let event = LogEvent { ts: now(), text };
         let mut events = self.events.lock().unwrap();
-        events.push_back(LogEvent { ts: now(), text });
+        // Sent while holding the lock, so `subscribe_events` never sees an event twice or misses one.
+        let _ = self.events_tx.send(event.clone());
+        events.push_back(event);
         while events.len() > MAX_EVENTS {
             events.pop_front();
         }
@@ -83,6 +93,12 @@ impl Miner {
 
     pub fn events(&self) -> Vec<LogEvent> {
         self.events.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// The recent events plus a receiver for every event after them.
+    pub fn subscribe_events(&self) -> (Vec<LogEvent>, broadcast::Receiver<LogEvent>) {
+        let events = self.events.lock().unwrap();
+        (events.iter().cloned().collect(), self.events_tx.subscribe())
     }
 
     pub fn streamers(&self) -> Vec<Arc<Streamer>> {

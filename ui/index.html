@@ -177,7 +177,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n) => Number(n).toLocaleString();
 const signed = (n) => (n > 0 ? "+" : "") + fmt(n);
-let lastEventTs = -1;
+const MAX_LOG_LINES = 300;
 const PRIO_HINT = $("prio-hint").textContent;
 
 let authed = null;
@@ -188,6 +188,7 @@ let orderLocked = true;
 try { orderLocked = localStorage.getItem("orderLocked") !== "0"; } catch {}
 
 function showAuth() {
+  disconnect();
   if (authed !== false) {
     authed = false;
     $("dashboard").hidden = true;
@@ -264,59 +265,112 @@ function renderRows(streamers) {
   }
 }
 
-function renderEvents(events) {
-  const newest = events.length ? events[events.length - 1].ts : -1;
-  if (newest === lastEventTs) return;
-  lastEventTs = newest;
+function logLine(e) {
+  const div = document.createElement("div");
+  div.innerHTML = `<time>${new Date(e.ts * 1000).toLocaleTimeString()}</time>${esc(e.text)}`;
+  return div;
+}
+
+// The server sends the recent lines on connect (`log-init`), then each new one (`log`).
+function setLog(events) {
+  const box = $("events");
+  box.replaceChildren(...events.map(logLine));
+  box.scrollTop = box.scrollHeight;
+}
+
+function appendLog(e) {
   const box = $("events");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
-  box.innerHTML = events.map((e) =>
-    `<div><time>${new Date(e.ts * 1000).toLocaleTimeString()}</time>${esc(e.text)}</div>`).join("");
+  box.append(logLine(e));
+  while (box.childElementCount > MAX_LOG_LINES) box.firstElementChild.remove();
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
+// One-off status fetch: right after an action (add, remove, ...) and to find out why the live
+// stream failed. Regular updates come from the stream.
 async function refresh() {
   try {
     const res = await fetch("api/status");
     if (res.status === 401) return showAuth();
-    const st = await res.json();
-    authed = true;
-    $("auth").hidden = true;
-    $("access").hidden = false;
-    if (!st.ready) {
-      $("dashboard").hidden = true;
-      $("login").hidden = false;
-      $("user").textContent = "not logged in";
-      const p = st.login_prompt;
-      $("login").innerHTML = p
-        ? `<div>Open <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a> and enter this code:</div>
-           <div class="code">${esc(p.code)}</div>
-           <div class="muted">Expires at ${new Date(p.expires_at * 1000).toLocaleTimeString()}</div>`
-        : '<div class="muted">Logging in…</div>';
-      return;
-    }
-    $("login").hidden = true;
-    $("dashboard").hidden = false;
-    $("user").textContent = "Mining as " + st.user;
-    $("s-channels").textContent = st.streamers.length;
-    $("s-live").textContent = st.streamers.filter((s) => s.online).length;
-    $("s-points").textContent = fmt(st.streamers.reduce((a, s) => a + s.points, 0));
-    $("s-gained").textContent = signed(st.streamers.reduce((a, s) => a + s.gained, 0));
-    renderRows(st.streamers);
-    const liveStarred = st.streamers.filter((s) => s.prioritized && s.online).length;
-    const hint = $("prio-hint");
-    hint.classList.toggle("warn", liveStarred > 2);
-    if (liveStarred > 2) {
-      hint.textContent = `${liveStarred} prioritized channels are live, but Twitch only counts 2 at a time. `
-        + "The ones higher in the list win.";
-    } else {
-      hint.textContent = PRIO_HINT;
-    }
-    renderEvents(st.events);
+    render(await res.json());
   } catch (e) {
     $("user").textContent = "connection lost, retrying…";
   }
 }
+
+function render(st) {
+  authed = true;
+  $("auth").hidden = true;
+  $("access").hidden = false;
+  if (!st.ready) {
+    $("dashboard").hidden = true;
+    $("login").hidden = false;
+    $("user").textContent = "not logged in";
+    const p = st.login_prompt;
+    $("login").innerHTML = p
+      ? `<div>Open <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a> and enter this code:</div>
+         <div class="code">${esc(p.code)}</div>
+         <div class="muted">Expires at ${new Date(p.expires_at * 1000).toLocaleTimeString()}</div>`
+      : '<div class="muted">Logging in…</div>';
+    return;
+  }
+  $("login").hidden = true;
+  $("dashboard").hidden = false;
+  $("user").textContent = "Mining as " + st.user;
+  $("s-channels").textContent = st.streamers.length;
+  $("s-live").textContent = st.streamers.filter((s) => s.online).length;
+  $("s-points").textContent = fmt(st.streamers.reduce((a, s) => a + s.points, 0));
+  $("s-gained").textContent = signed(st.streamers.reduce((a, s) => a + s.gained, 0));
+  renderRows(st.streamers);
+  const liveStarred = st.streamers.filter((s) => s.prioritized && s.online).length;
+  const hint = $("prio-hint");
+  hint.classList.toggle("warn", liveStarred > 2);
+  if (liveStarred > 2) {
+    hint.textContent = `${liveStarred} prioritized channels are live, but Twitch only counts 2 at a time. `
+      + "The ones higher in the list win.";
+  } else {
+    hint.textContent = PRIO_HINT;
+  }
+}
+
+// === Live updates (Server-Sent Events) === //
+
+let source = null;
+let retryTimer = 0;
+
+function connect() {
+  disconnect();
+  if (document.hidden) return;  // reconnects when the tab is shown again
+  source = new EventSource("api/stream");
+  source.addEventListener("status", (ev) => render(JSON.parse(ev.data)));
+  source.addEventListener("log-init", (ev) => setLog(JSON.parse(ev.data)));
+  source.addEventListener("log", (ev) => appendLog(JSON.parse(ev.data)));
+  source.onerror = () => {
+    if (authed) $("user").textContent = "connection lost, retrying…";
+    // The browser retries network errors by itself, but gives up on HTTP errors such as 401:
+    // check why, then try again (unless we've been logged out).
+    if (source.readyState === EventSource.CLOSED) {
+      disconnect();
+      refresh().finally(() => {
+        if (authed !== false) retryTimer = setTimeout(connect, 5000);
+      });
+    }
+  };
+}
+
+function disconnect() {
+  clearTimeout(retryTimer);
+  if (source) {
+    source.close();
+    source = null;
+  }
+}
+
+// No updates for background tabs.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) disconnect();
+  else if (authed !== false) connect();
+});
 
 $("add").addEventListener("submit", async (ev) => {
   ev.preventDefault();
@@ -529,7 +583,8 @@ $("auth-form").addEventListener("submit", async (ev) => {
     await tryLogin($("auth-token").value.trim());
     $("auth-token").value = "";
     authed = null;
-    await refresh();
+    $("auth").hidden = true;
+    connect();
   } catch (e) {
     msg.className = "msg err"; msg.textContent = e.message;
   } finally {
@@ -583,9 +638,8 @@ $("logout-btn").addEventListener("click", async () => {
     history.replaceState(null, "", location.pathname);
     await tryLogin(token).catch(() => {});
   }
-  refresh();
+  connect();
 })();
-setInterval(refresh, 5000);
 </script>
 </body>
 </html>
