@@ -1,0 +1,160 @@
+use chrono::{DateTime, Utc};
+use serde_json::Value;
+
+use crate::utils::percentage;
+
+fn parse_dt(v: &Value) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(v.as_str()?).ok().map(|d| d.with_timezone(&Utc))
+}
+
+#[derive(Debug, Clone)]
+pub struct Drop {
+    pub id: String,
+    pub name: String,
+    pub benefit: String,
+    pub minutes_required: i64,
+    pub has_preconditions_met: Option<bool>,
+    pub current_minutes_watched: i64,
+    pub drop_instance_id: Option<String>,
+    pub is_claimed: bool,
+    pub is_claimable: bool,
+    pub is_printable: bool,
+    pub percentage_progress: i64,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+}
+
+impl Drop {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let mut benefits: Vec<String> = v["benefitEdges"]
+            .as_array()
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| e["benefit"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        benefits.sort();
+        benefits.dedup();
+        Some(Self {
+            id: v["id"].as_str()?.to_string(),
+            name: v["name"].as_str().unwrap_or_default().to_string(),
+            benefit: benefits.join(", "),
+            minutes_required: v["requiredMinutesWatched"].as_i64().unwrap_or(0),
+            has_preconditions_met: None,
+            current_minutes_watched: 0,
+            drop_instance_id: None,
+            is_claimed: false,
+            is_claimable: false,
+            is_printable: false,
+            percentage_progress: 0,
+            start_at: parse_dt(&v["startAt"])?,
+            end_at: parse_dt(&v["endAt"])?,
+        })
+    }
+
+    pub fn dt_match(&self) -> bool {
+        let now = Utc::now();
+        self.start_at < now && now < self.end_at
+    }
+
+    /// Applies the `self` progress object from the inventory.
+    pub fn update(&mut self, progress: &Value) {
+        let watched = progress["currentMinutesWatched"].as_i64().unwrap_or(0);
+        self.has_preconditions_met = progress["hasPreconditionsMet"].as_bool();
+
+        let updated_percentage = percentage(watched, self.minutes_required);
+        let quarter = updated_percentage % 25 == 0;
+        self.is_printable = watched > self.current_minutes_watched
+            && ((updated_percentage > self.percentage_progress
+                && quarter
+                && self.current_minutes_watched != 0)
+                || (watched == 1 && self.current_minutes_watched == 0));
+
+        self.current_minutes_watched = watched;
+        self.drop_instance_id = progress["dropInstanceID"].as_str().map(str::to_string);
+        self.is_claimed = progress["isClaimed"].as_bool().unwrap_or(false);
+        self.is_claimable = !self.is_claimed && self.drop_instance_id.is_some();
+        self.percentage_progress = updated_percentage;
+    }
+
+    pub fn progress_bar(&self) -> String {
+        let progress = (self.percentage_progress / 2).clamp(0, 50) as usize;
+        format!(
+            "|{}{}|  {}% [{}/{}]",
+            "█".repeat(progress),
+            " ".repeat(50 - progress),
+            self.percentage_progress,
+            self.current_minutes_watched,
+            self.minutes_required
+        )
+    }
+}
+
+impl std::fmt::Display for Drop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}) {}/{} ({}%)",
+            self.name,
+            self.benefit,
+            self.current_minutes_watched,
+            self.minutes_required,
+            self.percentage_progress
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Campaign {
+    pub id: String,
+    pub game_id: String,
+    pub game_name: String,
+    pub name: String,
+    pub in_inventory: bool,
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+    pub drops: Vec<Drop>,
+}
+
+impl Campaign {
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            id: v["id"].as_str()?.to_string(),
+            game_id: v["game"]["id"].as_str().unwrap_or_default().to_string(),
+            game_name: v["game"]["displayName"].as_str().unwrap_or_default().to_string(),
+            name: v["name"].as_str().unwrap_or_default().to_string(),
+            in_inventory: false,
+            start_at: parse_dt(&v["startAt"])?,
+            end_at: parse_dt(&v["endAt"])?,
+            drops: v["timeBasedDrops"]
+                .as_array()
+                .map(|drops| drops.iter().filter_map(Drop::from_json).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn dt_match(&self) -> bool {
+        let now = Utc::now();
+        self.start_at < now && now < self.end_at
+    }
+
+    /// Removes drops that are already claimed or outside their time window.
+    pub fn clear_drops(&mut self) {
+        self.drops.retain(|d| d.dt_match() && !d.is_claimed);
+    }
+}
+
+impl std::fmt::Display for Campaign {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}, Game: {} - Drops: {} pcs. - In inventory: {}",
+            self.name,
+            self.game_name,
+            self.drops.len(),
+            self.in_inventory
+        )
+    }
+}

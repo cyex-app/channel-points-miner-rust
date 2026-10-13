@@ -1,0 +1,9 @@
+services:
+  points-miner:
+    build: .
+    container_name: points-miner
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/data

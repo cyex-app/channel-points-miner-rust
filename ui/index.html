@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Points Miner</title>
+<style>
+  :root {
+    --bg: #f6f6f8; --panel: #ffffff; --text: #18181b; --muted: #6b6b76; --border: #e4e4e9;
+    --accent: #9147ff; --accent-text: #ffffff; --live: #e91916; --ok: #1f9d55; --danger: #c62828;
+    --row-hover: #f2f0fa; --star: #e8a400;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0e10; --panel: #18181b; --text: #efeff1; --muted: #a0a0ab; --border: #2c2c33;
+      --accent: #a970ff; --accent-text: #0e0e10; --live: #ff4d4a; --ok: #3ccf7f; --danger: #ff6b6b;
+      --row-hover: #212127; --star: #ffc531;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .muted { color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-top: 16px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .stat .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .l { color: var(--muted); font-size: 12px; }
+  form { display: flex; gap: 8px; }
+  input[type=text], input[type=password] { flex: 1; min-width: 0; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font: inherit; }
+  input[type=text]:focus, input[type=password]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { padding: 9px 16px; border-radius: 8px; border: 0; background: var(--accent); color: var(--accent-text);
+    font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  button.remove { background: transparent; color: var(--danger); border: 1px solid var(--border); padding: 5px 10px; font-weight: 500; }
+  button.remove:hover { border-color: var(--danger); }
+  .msg { margin-top: 8px; min-height: 1.2em; font-size: 13px; }
+  .msg.err { color: var(--danger); } .msg.ok { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--row-hover); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .name { font-weight: 600; }
+  .name a { color: inherit; text-decoration: none; } .name a:hover { text-decoration: underline; }
+  .sub { color: var(--muted); font-size: 12px; max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 99px; margin-left: 6px; vertical-align: 1px; }
+  .badge.live { background: var(--live); color: #fff; }
+  .badge.watch { background: var(--accent); color: var(--accent-text); }
+  .badge.prio { background: var(--star); color: #18181b; }
+  .badge.follow { border: 1px solid var(--border); color: var(--muted); font-weight: 500; }
+  .gain { color: var(--ok); }
+  .name-row { display: flex; align-items: flex-start; gap: 8px; }
+  button.star { background: transparent; color: var(--muted); border: 0; padding: 0 2px; font-size: 18px; line-height: 1.2;
+    font-weight: 400; }
+  button.star:hover { color: var(--star); }
+  button.star.on { color: var(--star); }
+  .hint { margin: -4px 0 10px; font-size: 12px; }
+  .warn { color: var(--star); }
+  .empty { text-align: center; color: var(--muted); padding: 24px; }
+  #events { max-height: 340px; overflow-y: auto; font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
+  #events div { padding: 1px 0; } #events time { color: var(--muted); margin-right: 8px; }
+  .login { text-align: center; padding: 28px 16px; }
+  .login .code { font: 600 34px/1.2 ui-monospace, Consolas, monospace; letter-spacing: .15em; margin: 12px 0; color: var(--accent); }
+  .login a { color: var(--accent); }
+  #auth form { max-width: 420px; margin: 14px auto 0; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); font-weight: 500; }
+  button.secondary:hover { border-color: var(--muted); }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid var(--border); font-weight: 500; }
+  button.danger:hover { border-color: var(--danger); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .token { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+  .token code { flex: 1; min-width: 0; overflow-wrap: anywhere; padding: 8px 10px; border-radius: 8px;
+    background: var(--bg); border: 1px solid var(--border); font: 13px ui-monospace, Consolas, monospace; }
+  @media (max-width: 640px) {
+    .hide-sm { display: none; }
+    .sub { max-width: 180px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Points Miner</h1>
+    <span id="user" class="muted">connecting…</span>
+  </header>
+
+  <section id="auth" class="panel login" hidden>
+    <div>Enter the web UI login token.</div>
+    <div class="muted">It was printed in the console on first start and is saved in the <code>web_token</code> file next to your config.</div>
+    <form id="auth-form">
+      <input type="password" id="auth-token" placeholder="Login token" autocomplete="current-password" required>
+      <button type="submit" id="auth-btn">Log in</button>
+    </form>
+    <div id="auth-msg" class="msg"></div>
+  </section>
+
+  <section id="login" class="panel login" hidden></section>
+
+  <div id="dashboard" hidden>
+    <div class="stats">
+      <div class="stat"><div class="v" id="s-channels">0</div><div class="l">Channels</div></div>
+      <div class="stat"><div class="v" id="s-live">0</div><div class="l">Live now</div></div>
+      <div class="stat"><div class="v" id="s-points">0</div><div class="l">Total points</div></div>
+      <div class="stat"><div class="v gain" id="s-gained">0</div><div class="l">Gained this session</div></div>
+    </div>
+
+    <section class="panel">
+      <h2>Add a channel</h2>
+      <form id="add">
+        <input type="text" id="username" placeholder="Twitch username or channel URL" autocomplete="off" required>
+        <button type="submit" id="add-btn">Add</button>
+      </form>
+      <div id="add-msg" class="msg"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Channels</h2>
+      <p class="hint muted" id="prio-hint">Star a channel to prioritize it (e.g. for a watch-time badge). Prioritized
+        channels get one of the 2 watch slots whenever they're live, before streaks and drops.</p>
+      <table>
+        <thead><tr>
+          <th>Channel</th><th class="num">Points</th><th class="num">Session</th>
+          <th class="num hide-sm">Watched</th><th></th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>Activity</h2>
+      <div id="events"></div>
+    </section>
+  </div>
+
+  <section class="panel" id="access" hidden>
+    <h2>Web access</h2>
+    <p class="hint muted">If your login token leaked, regenerate it. Every other browser gets logged out and needs the new token.</p>
+    <div class="actions">
+      <button class="danger" id="regen-btn">Regenerate login token</button>
+      <button class="secondary" id="logout-btn">Log out</button>
+    </div>
+    <div id="new-token" class="token" hidden>
+      <code id="new-token-value"></code>
+      <button class="secondary" id="copy-btn">Copy</button>
+    </div>
+    <div id="access-msg" class="msg"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (n) => Number(n).toLocaleString();
+const signed = (n) => (n > 0 ? "+" : "") + fmt(n);
+let lastEventTs = -1;
+const PRIO_HINT = $("prio-hint").textContent;
+
+let authed = null;
+
+function showAuth() {
+  if (authed !== false) {
+    authed = false;
+    $("dashboard").hidden = true;
+    $("login").hidden = true;
+    $("access").hidden = true;
+    $("new-token").hidden = true;
+    $("auth").hidden = false;
+    $("user").textContent = "locked";
+    $("auth-token").focus();
+  }
+}
+
+// fetch() that switches to the token form when the session is no longer valid.
+async function api(url, opts) {
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    showAuth();
+    throw new Error("Not logged in");
+  }
+  return res;
+}
+
+async function tryLogin(token) {
+  const res = await fetch("/api/login", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+}
+
+function normalize(input) {
+  let s = input.trim();
+  const m = s.match(/twitch\.tv\/([A-Za-z0-9_]+)/);
+  if (m) s = m[1];
+  return s.replace(/^@/, "").toLowerCase();
+}
+
+function renderRows(streamers) {
+  if (!streamers.length) {
+    $("rows").innerHTML = '<tr><td colspan="5" class="empty">No channels yet. Add one above.</td></tr>';
+    return;
+  }
+  $("rows").innerHTML = streamers.map((s) => {
+    const badges = (s.online ? '<span class="badge live">LIVE</span>' : "")
+      + (s.prioritized ? '<span class="badge prio">priority</span>' : "")
+      + (s.watching ? '<span class="badge watch">watching</span>' : "")
+      + (s.source === "followers" ? '<span class="badge follow">followed</span>' : "");
+    const sub = s.online
+      ? esc([s.game, s.title].filter(Boolean).join(" · ")) + (s.viewers ? ` · ${fmt(s.viewers)} viewers` : "")
+      : "Offline";
+    const history = Object.entries(s.history).filter(([, h]) => h.counter)
+      .map(([k, h]) => `${k} ×${h.counter} (${signed(h.amount)})`).join(", ");
+    return `<tr title="${esc(history)}">
+      <td><div class="name-row">
+          <button class="star ${s.prioritized ? "on" : ""}" data-user="${esc(s.username)}" data-on="${s.prioritized ? 1 : 0}"
+            title="${s.prioritized ? "Stop prioritizing" : "Prioritize: always watch when live"}"
+            aria-label="${s.prioritized ? "Stop prioritizing" : "Prioritize"} ${esc(s.username)}">${s.prioritized ? "★" : "☆"}</button>
+          <div><div class="name"><a href="https://www.twitch.tv/${esc(s.username)}" target="_blank" rel="noopener">${esc(s.username)}</a>${badges}</div>
+          <div class="sub">${sub}</div></div></div></td>
+      <td class="num">${fmt(s.points)}</td>
+      <td class="num ${s.gained > 0 ? "gain" : ""}">${signed(s.gained)}</td>
+      <td class="num hide-sm">${s.online ? Math.floor(s.minutes_watched) + "m" : "–"}</td>
+      <td class="num"><button class="remove" data-user="${esc(s.username)}">Remove</button></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderEvents(events) {
+  const newest = events.length ? events[events.length - 1].ts : -1;
+  if (newest === lastEventTs) return;
+  lastEventTs = newest;
+  const box = $("events");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+  box.innerHTML = events.map((e) =>
+    `<div><time>${new Date(e.ts * 1000).toLocaleTimeString()}</time>${esc(e.text)}</div>`).join("");
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/status");
+    if (res.status === 401) return showAuth();
+    const st = await res.json();
+    authed = true;
+    $("auth").hidden = true;
+    $("access").hidden = false;
+    if (!st.ready) {
+      $("dashboard").hidden = true;
+      $("login").hidden = false;
+      $("user").textContent = "not logged in";
+      const p = st.login_prompt;
+      $("login").innerHTML = p
+        ? `<div>Open <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a> and enter this code:</div>
+           <div class="code">${esc(p.code)}</div>
+           <div class="muted">Expires at ${new Date(p.expires_at * 1000).toLocaleTimeString()}</div>`
+        : '<div class="muted">Logging in…</div>';
+      return;
+    }
+    $("login").hidden = true;
+    $("dashboard").hidden = false;
+    $("user").textContent = "Mining as " + st.user;
+    $("s-channels").textContent = st.streamers.length;
+    $("s-live").textContent = st.streamers.filter((s) => s.online).length;
+    $("s-points").textContent = fmt(st.streamers.reduce((a, s) => a + s.points, 0));
+    $("s-gained").textContent = signed(st.streamers.reduce((a, s) => a + s.gained, 0));
+    renderRows(st.streamers);
+    const liveStarred = st.streamers.filter((s) => s.prioritized && s.online).length;
+    const hint = $("prio-hint");
+    hint.classList.toggle("warn", liveStarred > 2);
+    if (liveStarred > 2) {
+      hint.textContent = `${liveStarred} prioritized channels are live, but Twitch only counts 2 at a time. `
+        + "The ones higher in the list win.";
+    } else {
+      hint.textContent = PRIO_HINT;
+    }
+    renderEvents(st.events);
+  } catch (e) {
+    $("user").textContent = "connection lost, retrying…";
+  }
+}
+
+$("add").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const username = normalize($("username").value);
+  if (!username) return;
+  const btn = $("add-btn"), msg = $("add-msg");
+  btn.disabled = true;
+  msg.className = "msg"; msg.textContent = `Adding ${username}…`;
+  try {
+    const res = await api("/api/streamers", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username }),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    msg.className = "msg ok"; msg.textContent = `Added ${body.username}${body.online ? " (live now)" : ""}.`;
+    $("username").value = "";
+    refresh();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("rows").addEventListener("click", async (ev) => {
+  const star = ev.target.closest("button.star");
+  if (star) {
+    star.disabled = true;
+    const res = await api("/api/streamers/" + encodeURIComponent(star.dataset.user) + "/prioritize", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prioritize: star.dataset.on !== "1" }),
+    }).catch(() => null);
+    if (!res) return;
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      $("add-msg").className = "msg err"; $("add-msg").textContent = body.error || "Update failed";
+    }
+    refresh();
+    return;
+  }
+  const btn = ev.target.closest("button.remove");
+  if (!btn) return;
+  const user = btn.dataset.user;
+  if (btn.dataset.confirm !== "1") {
+    btn.dataset.confirm = "1"; btn.textContent = "Confirm?";
+    setTimeout(() => { btn.dataset.confirm = ""; btn.textContent = "Remove"; }, 3000);
+    return;
+  }
+  btn.disabled = true;
+  const res = await api("/api/streamers/" + encodeURIComponent(user), { method: "DELETE" }).catch(() => null);
+  if (!res) return;
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    $("add-msg").className = "msg err"; $("add-msg").textContent = body.error || "Remove failed";
+  }
+  refresh();
+});
+
+$("auth-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const btn = $("auth-btn"), msg = $("auth-msg");
+  btn.disabled = true;
+  msg.className = "msg"; msg.textContent = "";
+  try {
+    await tryLogin($("auth-token").value.trim());
+    $("auth-token").value = "";
+    authed = null;
+    await refresh();
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("regen-btn").addEventListener("click", async () => {
+  const btn = $("regen-btn"), msg = $("access-msg");
+  if (btn.dataset.confirm !== "1") {
+    btn.dataset.confirm = "1"; btn.textContent = "Really regenerate? Click again";
+    setTimeout(() => { btn.dataset.confirm = ""; btn.textContent = "Regenerate login token"; }, 4000);
+    return;
+  }
+  btn.dataset.confirm = ""; btn.textContent = "Regenerate login token";
+  btn.disabled = true;
+  try {
+    const res = await api("/api/auth/regenerate", { method: "POST" });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    $("new-token-value").textContent = body.token;
+    $("new-token").hidden = false;
+    msg.className = "msg ok";
+    msg.textContent = "New token created. This browser stays logged in; save the token to log in elsewhere.";
+  } catch (e) {
+    msg.className = "msg err"; msg.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("copy-btn").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("new-token-value").textContent);
+    $("copy-btn").textContent = "Copied";
+  } catch {
+    getSelection().selectAllChildren($("new-token-value"));
+  }
+  setTimeout(() => { $("copy-btn").textContent = "Copy"; }, 2000);
+});
+
+$("logout-btn").addEventListener("click", async () => {
+  await fetch("/api/logout", { method: "POST" });
+  showAuth();
+});
+
+// Allow http://host:port/?token=... links: log in, then drop the token from the address bar.
+(async () => {
+  const token = new URLSearchParams(location.search).get("token");
+  if (token) {
+    history.replaceState(null, "", location.pathname);
+    await tryLogin(token).catch(() => {});
+  }
+  refresh();
+})();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

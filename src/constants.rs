@@ -1,0 +1,83 @@
+use serde_json::{json, Value};
+
+pub const TWITCH_URL: &str = "https://www.twitch.tv";
+pub const GQL_URL: &str = "https://gql.twitch.tv/gql";
+pub const PUBSUB_URL: &str = "wss://pubsub-edge.twitch.tv/v1";
+pub const IRC_HOST: &str = "irc.chat.twitch.tv";
+pub const IRC_PORT: u16 = 6667;
+
+/// Android TV client: the only first-party client that still offers the device-code login.
+pub const CLIENT_ID: &str = "ue6666qo983tsx6so1t0vnawi233wa";
+pub const CLIENT_VERSION: &str = "ef928475-9403-42f2-8a34-55784bd08e16";
+
+pub const TV_USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 7.1; Smart Box C1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36";
+pub const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36";
+/// The streamer page only embeds the settings.js URL for some user agents.
+pub const FIREFOX_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:85.0) Gecko/20100101 Firefox/85.0";
+
+/// A persisted GraphQL query: operation name + sha256 hash.
+pub struct Op(pub &'static str, pub &'static str);
+
+impl Op {
+    pub fn with(&self, variables: Value) -> Value {
+        json!({
+            "operationName": self.0,
+            "variables": variables,
+            "extensions": { "persistedQuery": { "version": 1, "sha256Hash": self.1 } },
+        })
+    }
+}
+
+pub const PLAYBACK_ACCESS_TOKEN: Op = Op(
+    "PlaybackAccessToken",
+    "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9",
+);
+pub const STREAM_INFO: Op = Op(
+    "VideoPlayerStreamInfoOverlayChannel",
+    "198492e0857f6aedead9665c81c5a06d67b25b58034649687124083ff288597d",
+);
+pub const CLAIM_COMMUNITY_POINTS: Op = Op(
+    "ClaimCommunityPoints",
+    "46aaeebe02c99afdf4fc97c7c0cba964124bf6b0af229395f1f6d1feed05b3d0",
+);
+pub const CLAIM_MOMENT: Op = Op(
+    "CommunityMomentCallout_Claim",
+    "e2d67415aead910f7f9ceb45a77b750a1e1d9622c936d832328a0689e054db62",
+);
+pub const CLAIM_DROP_REWARDS: Op = Op(
+    "DropsPage_ClaimDropRewards",
+    "a455deea71bdc9015b78eb49f4acfbce8baa7ccbedd28e549bb025bd0f751930",
+);
+pub const CHANNEL_POINTS_CONTEXT: Op = Op(
+    "ChannelPointsContext",
+    "7fe050e3761eb2cf258d70ee1a21cbd76fa8cf3d7e7b12fc437e7029d446b5e3",
+);
+pub const JOIN_RAID: Op = Op(
+    "JoinRaid",
+    "c6a332a86d1087fbbb1a8623aa01bd1313d2386e7c63be60fdb2d1901f01a4ae",
+);
+pub const INVENTORY: Op = Op(
+    "Inventory",
+    "d86775d0ef16a63a33ad52e80eaff963b2d5b72fada7c991504a57496e1d8e4b",
+);
+pub const VIEWER_DROPS_DASHBOARD: Op = Op(
+    "ViewerDropsDashboard",
+    "5a4da2ab3d5b47c9f9ce864e727b2cb346af1e3ea8b897fe8f704a97ff017619",
+);
+pub const DROP_CAMPAIGN_DETAILS: Op = Op(
+    "DropCampaignDetails",
+    "f6396f5ffdde867a8f6f6da18286e4baf02e5b98d14689a69b5af320a4c7b7b8",
+);
+pub const AVAILABLE_DROPS: Op = Op(
+    "DropsHighlightService_AvailableDrops",
+    "9a62a09bce5b53e26e64a671e530bc599cb6aab1e5ba3cbd5d85966d3940716f",
+);
+pub const GET_ID_FROM_LOGIN: Op = Op(
+    "GetIDFromLogin",
+    "94e82a7b1e3c21e186daa73ee2afc4b8f23bade1fbbff6fe8ac133f50a2f58ca",
+);
+pub const CHANNEL_FOLLOWS: Op = Op(
+    "ChannelFollows",
+    "eecf815273d3d949e5cf0085cc5084cd8a1b5b7b6f7990cf43cb0beadf546907",
+);
