@@ -18,7 +18,7 @@ use crate::{
         streamer::{ChatPresence, Source, Streamer, StreamerSettings},
     },
     pubsub::{PubSubMessage, PubSubPool},
-    twitch::Twitch,
+    twitch::{PointsContext, StreamInfo, Twitch},
     utils::{millify, now, random_between},
 };
 
@@ -108,10 +108,11 @@ impl Miner {
             self.claim_all_drops_from_inventory().await;
         }
 
-        let mut entries: Vec<(String, StreamerSettings, Source)> = Vec::new();
+        // (username, settings, source, channel id if already known)
+        let mut entries: Vec<(String, StreamerSettings, Source, Option<String>)> = Vec::new();
         for entry in &self.config.streamers {
             match entry.settings(&self.config.streamer_defaults) {
-                Ok(settings) => entries.push((entry.username(), settings, Source::Config)),
+                Ok(settings) => entries.push((entry.username(), settings, Source::Config, None)),
                 Err(e) => warn!("{e:#}"),
             }
         }
@@ -119,9 +120,9 @@ impl Miner {
             match self.twitch.followers(self.config.followers_order).await {
                 Ok(follows) => {
                     self.event(format!("Loaded {} followed channels from your profile", follows.len()));
-                    for name in follows {
+                    for (name, id) in follows {
                         if !self.config.blacklist.contains(&name) {
-                            entries.push((name, self.config.streamer_defaults.clone(), Source::Followers));
+                            entries.push((name, self.config.streamer_defaults.clone(), Source::Followers, id));
                         }
                     }
                 }
@@ -129,15 +130,17 @@ impl Miner {
             }
         }
         let mut seen = HashSet::new();
-        entries.retain(|(name, _, _)| seen.insert(name.clone()));
-
-        self.event(format!("Loading data for {} streamers. Please wait...", entries.len()));
-        for (name, settings, source) in entries {
-            tokio::time::sleep(random_between(0.3, 0.7)).await;
-            if let Err(e) = self.add_streamer(&name, settings, source, false).await {
-                warn!("Skipping {name}: {e:#}");
+        entries.retain_mut(|(name, ..)| match normalize_login(name) {
+            Ok(normalized) => {
+                *name = normalized;
+                seen.insert(name.clone())
             }
-        }
+            Err(e) => {
+                warn!("Skipping {name}: {e:#}");
+                false
+            }
+        });
+        self.load_streamers(entries).await;
 
         tokio::spawn(self.clone().watch_loop());
         tokio::spawn(self.clone().campaigns_loop());
@@ -151,10 +154,7 @@ impl Miner {
         source: Source,
         persist: bool,
     ) -> Result<Arc<Streamer>> {
-        let username = username.trim().trim_start_matches('@').to_lowercase();
-        if !valid_login(&username) {
-            bail!("'{username}' is not a valid Twitch username");
-        }
+        let username = normalize_login(username)?;
         if self.streamers.read().unwrap().iter().any(|s| s.username == username) {
             bail!("{username} is already being mined");
         }
@@ -179,17 +179,8 @@ impl Miner {
             .await?
             .ok_or_else(|| anyhow!("streamer {username} does not exist"))?;
         let streamer = Arc::new(Streamer::new(username.to_string(), channel_id, settings, source));
-
-        if let Err(e) = self.load_points_context(&streamer).await {
-            warn!("Could not load channel points for {username}: {e:#}");
-        }
-        self.check_online(&streamer).await;
-
-        self.streamers.write().unwrap().push(streamer.clone());
-        for topic in channel_topics(&streamer) {
-            self.pubsub.submit(topic);
-        }
-        self.update_chat(&streamer);
+        self.init_streamers(std::slice::from_ref(&streamer)).await;
+        self.register(&streamer);
 
         if persist {
             if let Err(e) = self.store.add_streamer(username) {
@@ -198,6 +189,100 @@ impl Miner {
             self.event(format!("Added {streamer}"));
         }
         Ok(streamer)
+    }
+
+    /// Loads the startup streamers with batched requests: one round for channel ids, one for
+    /// points + live status, one for drop campaigns of live channels.
+    async fn load_streamers(&self, mut entries: Vec<(String, StreamerSettings, Source, Option<String>)>) {
+        // Reserve the names so a web UI add can't load the same streamer meanwhile.
+        let reserved: Vec<String> = {
+            let existing: HashSet<String> = self.streamers().iter().map(|s| s.username.clone()).collect();
+            let mut adding = self.adding.lock().unwrap();
+            entries.retain(|(name, ..)| !existing.contains(name) && adding.insert(name.clone()));
+            entries.iter().map(|(name, ..)| name.clone()).collect()
+        };
+        self.event(format!("Loading data for {} streamers. Please wait...", entries.len()));
+
+        let unknown: Vec<String> = entries
+            .iter()
+            .filter(|(.., id)| id.is_none())
+            .map(|(name, ..)| name.clone())
+            .collect();
+        let mut ids = self.twitch.channel_ids(&unknown).await.into_iter();
+        let mut streamers = Vec::with_capacity(entries.len());
+        for (name, settings, source, id) in entries {
+            let id = match id {
+                Some(id) => Ok(Some(id)),
+                None => ids.next().unwrap_or_else(|| Err(anyhow!("no channel id returned"))),
+            };
+            match id {
+                Ok(Some(id)) => streamers.push(Arc::new(Streamer::new(name, id, settings, source))),
+                Ok(None) => warn!("Skipping {name}: streamer does not exist"),
+                Err(e) => warn!("Skipping {name}: {e:#}"),
+            }
+        }
+
+        self.init_streamers(&streamers).await;
+        for streamer in &streamers {
+            self.register(streamer);
+        }
+        let mut adding = self.adding.lock().unwrap();
+        for name in &reserved {
+            adding.remove(name);
+        }
+    }
+
+    /// Loads channel points and live status for new streamers in as few requests as possible.
+    async fn init_streamers(&self, streamers: &[Arc<Streamer>]) {
+        let logins: Vec<String> = streamers.iter().map(|s| s.username.clone()).collect();
+        let overview = self.twitch.channels_overview(&logins).await;
+
+        let mut claims = Vec::new();
+        let mut live = Vec::new();
+        for (streamer, (points, info)) in streamers.iter().zip(overview) {
+            match points {
+                Ok(Some(ctx)) => {
+                    if let Some(claim_id) = self.apply_points(streamer, ctx) {
+                        claims.push((streamer, claim_id));
+                    }
+                }
+                Ok(None) => warn!("Could not load channel points for {}: channel not found", streamer.username),
+                Err(e) => warn!("Could not load channel points for {}: {e:#}", streamer.username),
+            }
+            match info {
+                Ok(Some(info)) => live.push((streamer, info)),
+                Ok(None) => self.set_offline(streamer),
+                Err(e) => warn!("Could not update stream info for {}: {e:#}", streamer.username),
+            }
+        }
+
+        let drops_channels: Vec<String> = live
+            .iter()
+            .filter(|(s, info)| wants_campaigns(s, info))
+            .map(|(s, _)| s.channel_id.clone())
+            .collect();
+        let mut campaigns = self.twitch.campaign_ids_for_channels(&drops_channels).await.into_iter();
+        for (streamer, info) in live {
+            let campaigns_ids = match wants_campaigns(streamer, &info) {
+                true => campaigns.next().unwrap_or_default(),
+                false => Vec::new(),
+            };
+            self.apply_stream_info(streamer, info, campaigns_ids);
+            self.set_online(streamer);
+        }
+
+        for (streamer, claim_id) in claims {
+            self.claim_bonus(streamer, &claim_id).await;
+        }
+    }
+
+    /// Starts mining a loaded streamer: PubSub topics and chat.
+    fn register(&self, streamer: &Arc<Streamer>) {
+        self.streamers.write().unwrap().push(streamer.clone());
+        for topic in channel_topics(streamer) {
+            self.pubsub.submit(topic);
+        }
+        self.update_chat(streamer);
     }
 
     pub fn remove_streamer(&self, username: &str) -> Result<()> {
@@ -304,18 +389,8 @@ impl Miner {
     }
 
     async fn check_online(&self, streamer: &Streamer) {
-        let (skip, was_online) = {
-            let st = streamer.state();
-            (now() < st.offline_at + 60.0, st.is_online)
-        };
-        if skip {
+        if now() < streamer.state().offline_at + 60.0 {
             return;
-        }
-        if !was_online {
-            match self.twitch.spade_url(&streamer.username).await {
-                Ok(url) => streamer.state().stream.spade_url = Some(url),
-                Err(e) => warn!("Could not extract spade_url for {}: {e:#}", streamer.username),
-            }
         }
         match self.update_stream(streamer).await {
             Ok(true) => self.set_online(streamer),
@@ -332,12 +407,16 @@ impl Miner {
         let Some(info) = self.twitch.stream_info(&streamer.username).await? else {
             return Ok(false);
         };
-        let drops_game = info.game.clone().filter(|_| streamer.settings.claim_drops);
-        let campaigns_ids = match drops_game {
-            Some(_) => self.twitch.campaign_ids_for_channel(&streamer.channel_id).await,
-            None => Vec::new(),
+        let campaigns_ids = match wants_campaigns(streamer, &info) {
+            true => self.twitch.campaign_ids_for_channel(&streamer.channel_id).await,
+            false => Vec::new(),
         };
+        self.apply_stream_info(streamer, info, campaigns_ids);
+        Ok(true)
+    }
 
+    fn apply_stream_info(&self, streamer: &Streamer, info: StreamInfo, campaigns_ids: Vec<String>) {
+        let drops_game = info.game.clone().filter(|_| streamer.settings.claim_drops);
         let user_id = &self.twitch.creds.user_id;
         let mut properties = json!({
             "channel_id": streamer.channel_id,
@@ -357,22 +436,24 @@ impl Miner {
             .update(info.broadcast_id, &info.title, info.game, info.viewers);
         st.stream.campaigns_ids = campaigns_ids;
         st.stream.payload = Some(json!([{ "event": "minute-watched", "properties": properties }]));
-        Ok(true)
     }
 
     async fn load_points_context(&self, streamer: &Streamer) -> Result<()> {
         let Some(ctx) = self.twitch.channel_points_context(&streamer.username).await? else {
             bail!("streamer {} does not exist", streamer.username);
         };
-        {
-            let mut st = streamer.state();
-            st.set_points(ctx.balance);
-            st.multipliers = ctx.multipliers;
-        }
-        if let Some(claim_id) = ctx.claim_id {
+        if let Some(claim_id) = self.apply_points(streamer, ctx) {
             self.claim_bonus(streamer, &claim_id).await;
         }
         Ok(())
+    }
+
+    /// Returns the id of a bonus waiting to be claimed.
+    fn apply_points(&self, streamer: &Streamer, ctx: PointsContext) -> Option<String> {
+        let mut st = streamer.state();
+        st.set_points(ctx.balance);
+        st.multipliers = ctx.multipliers;
+        ctx.claim_id
     }
 
     async fn claim_bonus(&self, streamer: &Streamer, claim_id: &str) {
@@ -484,20 +565,15 @@ impl Miner {
     }
 
     async fn watch_once(&self, streamer: &Streamer) -> Result<()> {
-        let (spade, payload) = {
-            let st = streamer.state();
-            (st.stream.spade_url.clone(), st.stream.encode_payload())
-        };
-        let spade = match spade {
-            Some(url) => url,
-            None => {
-                let url = self.twitch.spade_url(&streamer.username).await?;
-                streamer.state().stream.spade_url = Some(url.clone());
-                url
-            }
-        };
-        let payload = payload.ok_or_else(|| anyhow!("no stream payload yet"))?;
+        let payload = streamer
+            .state()
+            .stream
+            .encode_payload()
+            .ok_or_else(|| anyhow!("no stream payload yet"))?;
+        let spade = self.twitch.spade_url(&streamer.username).await?;
         if !self.twitch.watch(&streamer.username, &spade, &payload).await? {
+            // The cached endpoint may have changed; scrape it again next time.
+            self.twitch.forget_spade_url();
             return Ok(());
         }
 
@@ -778,4 +854,17 @@ fn channel_topics(streamer: &Streamer) -> Vec<String> {
         topics.push(format!("community-moments-channel-v1.{id}"));
     }
     topics
+}
+
+fn normalize_login(name: &str) -> Result<String> {
+    let name = name.trim().trim_start_matches('@').to_lowercase();
+    if !valid_login(&name) {
+        bail!("'{name}' is not a valid Twitch username");
+    }
+    Ok(name)
+}
+
+/// Whether to look up drop campaigns for a live stream.
+fn wants_campaigns(streamer: &Streamer, info: &StreamInfo) -> bool {
+    streamer.settings.claim_drops && info.game.is_some()
 }

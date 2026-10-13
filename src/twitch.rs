@@ -13,8 +13,11 @@ use crate::{
     config::FollowersOrder,
     constants::*,
     entities::stream::Game,
-    utils::{now, random_hex},
+    utils::{now, random_between, random_hex},
 };
+
+/// Queries per batched GQL request (Twitch rejects batches much larger than this).
+const GQL_BATCH: usize = 30;
 
 pub struct PointsContext {
     pub balance: i64,
@@ -35,9 +38,63 @@ pub struct Twitch {
     client_session: String,
     /// (Client-Version, fetched at)
     client_version: Mutex<(String, f64)>,
+    /// The analytics endpoint is the same for every channel, so it is scraped once and cached.
+    spade_url: Mutex<Option<String>>,
     build_id_re: Regex,
     settings_re: Regex,
     spade_re: Regex,
+}
+
+fn parse_channel_id(resp: &Value) -> Result<Option<String>> {
+    if resp.get("data").is_none() {
+        bail!("unexpected response: {resp}");
+    }
+    Ok(resp["data"]["user"]["id"].as_str().map(str::to_string))
+}
+
+/// `Ok(None)` means the channel is offline.
+fn parse_stream_info(resp: &Value) -> Result<Option<StreamInfo>> {
+    let user = &resp["data"]["user"];
+    if resp.get("data").is_none() {
+        bail!("unexpected response: {resp}");
+    }
+    let stream = &user["stream"];
+    if stream.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(StreamInfo {
+        broadcast_id: stream["id"].as_str().unwrap_or_default().to_string(),
+        title: user["broadcastSettings"]["title"].as_str().unwrap_or_default().to_string(),
+        game: Game::from_json(&user["broadcastSettings"]["game"]),
+        viewers: stream["viewersCount"].as_i64().unwrap_or(0),
+    }))
+}
+
+/// `Ok(None)` means the channel does not exist.
+fn parse_points_context(resp: &Value) -> Result<Option<PointsContext>> {
+    let data = &resp["data"];
+    if data.is_null() {
+        bail!("unexpected response: {resp}");
+    }
+    if data["community"].is_null() {
+        return Ok(None);
+    }
+    let points = &data["community"]["channel"]["self"]["communityPoints"];
+    Ok(Some(PointsContext {
+        balance: points["balance"].as_i64().unwrap_or(0),
+        multipliers: points["activeMultipliers"]
+            .as_array()
+            .map(|m| m.iter().filter_map(|x| x["factor"].as_f64()).collect())
+            .unwrap_or_default(),
+        claim_id: points["availableClaim"]["id"].as_str().map(str::to_string),
+    }))
+}
+
+fn parse_campaign_ids(resp: &Value) -> Vec<String> {
+    resp["data"]["channel"]["viewerDropCampaigns"]
+        .as_array()
+        .map(|c| c.iter().filter_map(|x| x["id"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 fn last_url_line(text: &str) -> Option<&str> {
@@ -54,6 +111,7 @@ impl Twitch {
             creds,
             client_session: random_hex(16),
             client_version: Mutex::new((CLIENT_VERSION.to_string(), 0.0)),
+            spade_url: Mutex::new(None),
             build_id_re: Regex::new(
                 r#"window\.__twilightBuildID\s*=\s*"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})""#,
             )
@@ -115,35 +173,92 @@ impl Twitch {
         serde_json::from_str(&text).with_context(|| format!("GQL returned {status}: {text}"))
     }
 
-    pub async fn get_channel_id(&self, login: &str) -> Result<Option<String>> {
-        let resp = self.gql(&GET_ID_FROM_LOGIN.with(json!({ "login": login }))).await?;
-        if resp.get("data").is_none() {
-            bail!("unexpected response: {resp}");
+    /// Sends many queries in as few requests as possible. Results are in the same order as
+    /// `bodies`; a failed query only fails its own result.
+    pub async fn gql_batch(&self, bodies: Vec<Value>) -> Vec<Result<Value>> {
+        let mut results = Vec::with_capacity(bodies.len());
+        for (i, chunk) in bodies.chunks(GQL_BATCH).enumerate() {
+            if i > 0 {
+                tokio::time::sleep(random_between(0.5, 1.0)).await;
+            }
+            match self.gql(&Value::Array(chunk.to_vec())).await {
+                Ok(Value::Array(items)) if items.len() == chunk.len() => {
+                    results.extend(items.into_iter().map(Ok));
+                }
+                Ok(other) => {
+                    let got = other.as_array().map_or(0, Vec::len);
+                    results.extend(chunk.iter().map(|_| {
+                        Err(anyhow!("batch returned {got} results for {} queries", chunk.len()))
+                    }));
+                }
+                Err(e) => results.extend(chunk.iter().map(|_| Err(anyhow!("{e:#}")))),
+            }
         }
-        Ok(resp["data"]["user"]["id"].as_str().map(str::to_string))
+        results
+    }
+
+    pub async fn get_channel_id(&self, login: &str) -> Result<Option<String>> {
+        parse_channel_id(&self.gql(&GET_ID_FROM_LOGIN.with(json!({ "login": login }))).await?)
+    }
+
+    pub async fn channel_ids(&self, logins: &[String]) -> Vec<Result<Option<String>>> {
+        let bodies = logins
+            .iter()
+            .map(|login| GET_ID_FROM_LOGIN.with(json!({ "login": login })))
+            .collect();
+        self.gql_batch(bodies)
+            .await
+            .into_iter()
+            .map(|r| r.and_then(|resp| parse_channel_id(&resp)))
+            .collect()
     }
 
     /// `Ok(None)` means the channel is offline.
     pub async fn stream_info(&self, login: &str) -> Result<Option<StreamInfo>> {
-        let resp = self.gql(&STREAM_INFO.with(json!({ "channel": login }))).await?;
-        let user = &resp["data"]["user"];
-        if resp.get("data").is_none() {
-            bail!("unexpected response: {resp}");
-        }
-        let stream = &user["stream"];
-        if stream.is_null() {
-            return Ok(None);
-        }
-        Ok(Some(StreamInfo {
-            broadcast_id: stream["id"].as_str().unwrap_or_default().to_string(),
-            title: user["broadcastSettings"]["title"].as_str().unwrap_or_default().to_string(),
-            game: Game::from_json(&user["broadcastSettings"]["game"]),
-            viewers: stream["viewersCount"].as_i64().unwrap_or(0),
-        }))
+        parse_stream_info(&self.gql(&STREAM_INFO.with(json!({ "channel": login }))).await?)
     }
 
-    /// Scrapes the analytics ("spade") endpoint used for minute-watched events.
+    /// Points context and stream info for many channels, batched together.
+    pub async fn channels_overview(
+        &self,
+        logins: &[String],
+    ) -> Vec<(Result<Option<PointsContext>>, Result<Option<StreamInfo>>)> {
+        let bodies = logins
+            .iter()
+            .flat_map(|login| {
+                [
+                    CHANNEL_POINTS_CONTEXT.with(json!({ "channelLogin": login })),
+                    STREAM_INFO.with(json!({ "channel": login })),
+                ]
+            })
+            .collect();
+        let mut results = self.gql_batch(bodies).await.into_iter();
+        let mut overview = Vec::with_capacity(logins.len());
+        while let (Some(points), Some(info)) = (results.next(), results.next()) {
+            overview.push((
+                points.and_then(|resp| parse_points_context(&resp)),
+                info.and_then(|resp| parse_stream_info(&resp)),
+            ));
+        }
+        overview
+    }
+
+    /// The analytics ("spade") endpoint used for minute-watched events, scraped on first use.
     pub async fn spade_url(&self, login: &str) -> Result<String> {
+        if let Some(url) = self.spade_url.lock().unwrap().clone() {
+            return Ok(url);
+        }
+        let url = self.fetch_spade_url(login).await?;
+        *self.spade_url.lock().unwrap() = Some(url.clone());
+        Ok(url)
+    }
+
+    /// Makes the next `spade_url` call scrape it again.
+    pub fn forget_spade_url(&self) {
+        *self.spade_url.lock().unwrap() = None;
+    }
+
+    async fn fetch_spade_url(&self, login: &str) -> Result<String> {
         let page = self
             .http
             .get(format!("{TWITCH_URL}/{login}"))
@@ -174,25 +289,11 @@ impl Twitch {
 
     /// `Ok(None)` means the channel does not exist.
     pub async fn channel_points_context(&self, login: &str) -> Result<Option<PointsContext>> {
-        let resp = self
-            .gql(&CHANNEL_POINTS_CONTEXT.with(json!({ "channelLogin": login })))
-            .await?;
-        let data = &resp["data"];
-        if data.is_null() {
-            bail!("unexpected response: {resp}");
-        }
-        if data["community"].is_null() {
-            return Ok(None);
-        }
-        let points = &data["community"]["channel"]["self"]["communityPoints"];
-        Ok(Some(PointsContext {
-            balance: points["balance"].as_i64().unwrap_or(0),
-            multipliers: points["activeMultipliers"]
-                .as_array()
-                .map(|m| m.iter().filter_map(|x| x["factor"].as_f64()).collect())
-                .unwrap_or_default(),
-            claim_id: points["availableClaim"]["id"].as_str().map(str::to_string),
-        }))
+        parse_points_context(
+            &self
+                .gql(&CHANNEL_POINTS_CONTEXT.with(json!({ "channelLogin": login })))
+                .await?,
+        )
     }
 
     pub async fn claim_bonus(&self, channel_id: &str, claim_id: &str) -> Result<()> {
@@ -222,10 +323,20 @@ impl Twitch {
         else {
             return Vec::new();
         };
-        resp["data"]["channel"]["viewerDropCampaigns"]
-            .as_array()
-            .map(|c| c.iter().filter_map(|x| x["id"].as_str().map(str::to_string)).collect())
-            .unwrap_or_default()
+        parse_campaign_ids(&resp)
+    }
+
+    /// Drop campaign ids for many channels; a failed lookup yields no campaigns.
+    pub async fn campaign_ids_for_channels(&self, channel_ids: &[String]) -> Vec<Vec<String>> {
+        let bodies = channel_ids
+            .iter()
+            .map(|id| AVAILABLE_DROPS.with(json!({ "channelID": id })))
+            .collect();
+        self.gql_batch(bodies)
+            .await
+            .into_iter()
+            .map(|r| r.map(|resp| parse_campaign_ids(&resp)).unwrap_or_default())
+            .collect()
     }
 
     pub async fn inventory(&self) -> Result<Value> {
@@ -286,7 +397,8 @@ impl Twitch {
         )
     }
 
-    pub async fn followers(&self, order: FollowersOrder) -> Result<Vec<String>> {
+    /// (login, channel id) of every followed channel; the id is `None` if Twitch didn't include it.
+    pub async fn followers(&self, order: FollowersOrder) -> Result<Vec<(String, Option<String>)>> {
         let order = match order {
             FollowersOrder::Asc => "ASC",
             FollowersOrder::Desc => "DESC",
@@ -303,7 +415,8 @@ impl Twitch {
                 .ok_or_else(|| anyhow!("unexpected follows response: {resp}"))?;
             for edge in edges {
                 if let Some(login) = edge["node"]["login"].as_str() {
-                    follows.push(login.to_lowercase());
+                    let id = edge["node"]["id"].as_str().map(str::to_string);
+                    follows.push((login.to_lowercase(), id));
                 }
                 cursor = edge["cursor"].clone();
             }
