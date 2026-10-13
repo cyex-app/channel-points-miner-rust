@@ -188,7 +188,7 @@ async function api(url, opts) {
 }
 
 async function tryLogin(token) {
-  const res = await fetch("/api/login", {
+  const res = await fetch("api/login", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }),
   });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
@@ -244,7 +244,7 @@ function renderEvents(events) {
 
 async function refresh() {
   try {
-    const res = await fetch("/api/status");
+    const res = await fetch("api/status");
     if (res.status === 401) return showAuth();
     const st = await res.json();
     authed = true;
@@ -293,7 +293,7 @@ $("add").addEventListener("submit", async (ev) => {
   btn.disabled = true;
   msg.className = "msg"; msg.textContent = `Adding ${username}…`;
   try {
-    const res = await api("/api/streamers", {
+    const res = await api("api/streamers", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username }),
     });
     const body = await res.json();
@@ -312,7 +312,7 @@ $("rows").addEventListener("click", async (ev) => {
   const star = ev.target.closest("button.star");
   if (star) {
     star.disabled = true;
-    const res = await api("/api/streamers/" + encodeURIComponent(star.dataset.user) + "/prioritize", {
+    const res = await api("api/streamers/" + encodeURIComponent(star.dataset.user) + "/prioritize", {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prioritize: star.dataset.on !== "1" }),
     }).catch(() => null);
@@ -333,7 +333,7 @@ $("rows").addEventListener("click", async (ev) => {
     return;
   }
   btn.disabled = true;
-  const res = await api("/api/streamers/" + encodeURIComponent(user), { method: "DELETE" }).catch(() => null);
+  const res = await api("api/streamers/" + encodeURIComponent(user), { method: "DELETE" }).catch(() => null);
   if (!res) return;
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -369,7 +369,7 @@ $("regen-btn").addEventListener("click", async () => {
   btn.dataset.confirm = ""; btn.textContent = "Regenerate login token";
   btn.disabled = true;
   try {
-    const res = await api("/api/auth/regenerate", { method: "POST" });
+    const res = await api("api/auth/regenerate", { method: "POST" });
     const body = await res.json();
     if (!res.ok) throw new Error(body.error || res.statusText);
     $("new-token-value").textContent = body.token;
@@ -394,7 +394,7 @@ $("copy-btn").addEventListener("click", async () => {
 });
 
 $("logout-btn").addEventListener("click", async () => {
-  await fetch("/api/logout", { method: "POST" });
+  await fetch("api/logout", { method: "POST" });
   showAuth();
 });
 
