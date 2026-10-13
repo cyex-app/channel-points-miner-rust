@@ -3,8 +3,7 @@ use serde_json::{json, Value};
 pub const TWITCH_URL: &str = "https://www.twitch.tv";
 pub const GQL_URL: &str = "https://gql.twitch.tv/gql";
 pub const PUBSUB_URL: &str = "wss://pubsub-edge.twitch.tv/v1";
-pub const IRC_HOST: &str = "irc.chat.twitch.tv";
-pub const IRC_PORT: u16 = 6667;
+pub const IRC_URL: &str = "wss://irc-ws.chat.twitch.tv:443";
 
 /// Android TV client: the only first-party client that still offers the device-code login.
 pub const CLIENT_ID: &str = "ue6666qo983tsx6so1t0vnawi233wa";
