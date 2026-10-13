@@ -1,7 +1,10 @@
+name: points-miner-rust
+
 services:
-  points-miner:
+  points-miner-rust:
     build: .
-    container_name: points-miner
+    image: points-miner-rust
+    container_name: points-miner-rust
     restart: unless-stopped
     ports:
       - "5000:5000"

@@ -51,8 +51,8 @@ in the logs. You can also read the token with `cat data/web_token`.
 Without Compose:
 
 ```sh
-docker build -t points-miner .
-docker run -d --name points-miner --restart unless-stopped -p 5000:5000 -v "$PWD/data:/data" points-miner
+docker build -t points-miner-rust .
+docker run -d --name points-miner-rust --restart unless-stopped -p 5000:5000 -v "$PWD/data:/data" points-miner-rust
 ```
 
 ## Features
