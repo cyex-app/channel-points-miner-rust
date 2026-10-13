@@ -5,6 +5,7 @@ mod constants;
 mod entities;
 mod miner;
 mod pubsub;
+mod store;
 #[cfg(test)]
 mod tests;
 mod twitch;
@@ -23,8 +24,9 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    config::{Config, ConfigStore, EXAMPLE_CONFIG},
+    config::{Config, EXAMPLE_CONFIG},
     miner::Miner,
+    store::Store,
     twitch::Twitch,
     web::{AppState, WebAuth},
 };
@@ -82,13 +84,9 @@ async fn main() -> Result<()> {
         .context("login failed")?;
     info!("Logged in as {} (user id {})", creds.login, creds.user_id);
 
+    let store = Store::open(&data_dir.join("miner.db"))?;
     let (pubsub_tx, pubsub_rx) = mpsc::unbounded_channel();
-    let miner = Arc::new(Miner::new(
-        Twitch::new(http, creds),
-        config,
-        ConfigStore::new(config_path),
-        pubsub_tx,
-    ));
+    let miner = Arc::new(Miner::new(Twitch::new(http, creds), config, store, pubsub_tx));
     let _ = state.miner.set(miner.clone());
     tokio::spawn(miner.clone().run(pubsub_rx));
 

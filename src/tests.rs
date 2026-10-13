@@ -1,9 +1,10 @@
 use serde_json::json;
 
 use crate::{
-    config::{Config, ConfigStore, EXAMPLE_CONFIG},
-    entities::streamer::ChatPresence,
+    config::{Config, EXAMPLE_CONFIG},
+    entities::streamer::{ChatPresence, Source},
     pubsub::PubSubMessage,
+    store::Store,
 };
 
 #[test]
@@ -29,61 +30,68 @@ fn per_streamer_overrides_merge_with_defaults() {
     assert_eq!(settings.chat, ChatPresence::Never);
 }
 
-#[test]
-fn config_store_adds_and_removes_preserving_comments() {
-    let dir = std::env::temp_dir().join(format!("points-miner-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("config.toml");
-    std::fs::write(&path, EXAMPLE_CONFIG.replace("blacklist = []", "blacklist = [\"foo\"]")).unwrap();
-    let store = ConfigStore::new(path.clone());
-
-    store.add_streamer("foo").unwrap();
-    store.add_streamer("bar").unwrap();
-    store.add_streamer("bar").unwrap();
-    let config: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    let names: Vec<_> = config.streamers.iter().map(|s| s.username()).collect();
-    assert_eq!(names, ["foo", "bar"]);
-    assert!(config.blacklist.is_empty(), "adding a channel un-blacklists it");
-
-    store.remove_streamer("foo").unwrap();
-    store.add_to_blacklist("baz").unwrap();
-    let text = std::fs::read_to_string(&path).unwrap();
-    let config: Config = toml::from_str(&text).unwrap();
-    let names: Vec<_> = config.streamers.iter().map(|s| s.username()).collect();
-    assert_eq!(names, ["bar"]);
-    assert_eq!(config.blacklist, ["baz"]);
-    assert!(text.contains("# Twitch account to mine with"));
-    std::fs::remove_dir_all(dir).ok();
+fn ids(store: &Store) -> Vec<String> {
+    store.channels().unwrap().into_iter().map(|c| c.id).collect()
 }
 
 #[test]
-fn config_store_toggles_prioritize() {
-    let dir = std::env::temp_dir().join(format!("points-miner-prio-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("config.toml");
-    std::fs::write(
-        &path,
-        EXAMPLE_CONFIG.replace("streamers = []", r#"streamers = ["a", { username = "b", chat = "NEVER" }]"#),
-    )
-    .unwrap();
-    let store = ConfigStore::new(path.clone());
-    let load = || -> Config { toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap() };
+fn store_adds_removes_and_blacklists() {
+    let store = Store::open_in_memory().unwrap();
+    let none = json!({});
+    store.add_channel("1", "a", Source::Manual, false, &none).unwrap();
+    store.add_channel("2", "b", Source::Followers, false, &none).unwrap();
+    store.add_channel("3", "c", Source::Manual, true, &json!({ "chat": "NEVER" })).unwrap();
+    assert_eq!(ids(&store), ["1", "2", "3"]);
 
-    store.set_prioritize("a", true).unwrap();
-    store.set_prioritize("b", true).unwrap();
-    store.set_prioritize("followed", true).unwrap();
-    let config = load();
-    let names: Vec<_> = config.streamers.iter().map(|s| s.username()).collect();
-    assert_eq!(names, ["a", "b", "followed"]);
-    for entry in &config.streamers {
-        assert!(entry.settings(&config.streamer_defaults).unwrap().prioritize);
+    let c = &store.channels().unwrap()[2];
+    assert!(c.prioritized);
+    assert_eq!(c.settings, json!({ "chat": "NEVER" }));
+
+    // Adding an existing channel keeps its place; adding it by hand makes it a manual channel.
+    store.add_channel("2", "b_renamed", Source::Manual, false, &none).unwrap();
+    store.add_channel("1", "a", Source::Followers, false, &none).unwrap();
+    let rows = store.channels().unwrap();
+    assert_eq!(ids(&store), ["1", "2", "3"]);
+    assert_eq!(rows[0].source, Source::Manual);
+    assert_eq!(rows[1].source, Source::Manual);
+    assert_eq!(rows[1].login, "b_renamed");
+
+    store.remove_channel("2").unwrap();
+    store.add_to_blacklist("2", "b").unwrap();
+    assert_eq!(ids(&store), ["1", "3"]);
+    assert!(store.blacklist().unwrap().contains("2"));
+    store.remove_from_blacklist("2").unwrap();
+    assert!(store.blacklist().unwrap().is_empty());
+
+    store.set_prioritized("1", true).unwrap();
+    store.set_login("1", "new_name").unwrap();
+    let a = &store.channels().unwrap()[0];
+    assert!(a.prioritized);
+    assert_eq!(a.login, "new_name");
+
+    assert_eq!(store.meta("config_imported").unwrap(), None);
+    store.set_meta("config_imported", "1").unwrap();
+    assert_eq!(store.meta("config_imported").unwrap().as_deref(), Some("1"));
+}
+
+#[test]
+fn store_reorders() {
+    let store = Store::open_in_memory().unwrap();
+    for id in ["1", "2", "3", "4"] {
+        store.add_channel(id, id, Source::Manual, false, &json!({})).unwrap();
     }
+    let order = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-    store.set_prioritize("a", false).unwrap();
-    store.set_prioritize("b", false).unwrap();
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains(r#"streamers = ["a", { username = "b", chat = "NEVER" }, { username = "followed", prioritize = true }]"#), "{text}");
-    std::fs::remove_dir_all(dir).ok();
+    store.reorder(&order(&["3", "1", "4", "2"])).unwrap();
+    assert_eq!(ids(&store), ["3", "1", "4", "2"]);
+
+    // Unknown ids are ignored, missing ones keep their relative order at the end.
+    store.reorder(&order(&["2", "nope", "2"])).unwrap();
+    assert_eq!(ids(&store), ["2", "3", "1", "4"]);
+
+    // New channels go to the end.
+    store.add_channel("5", "5", Source::Manual, false, &json!({})).unwrap();
+    assert_eq!(ids(&store), ["2", "3", "1", "4", "5"]);
 }
 
 #[test]

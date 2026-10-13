@@ -45,8 +45,8 @@ impl Default for StreamerSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
-    /// Listed in the config file (or added through the web UI, which writes to the config).
-    Config,
+    /// Added by hand (web UI, or imported from the old `streamers` list in the config).
+    Manual,
     /// Loaded from the account's follow list.
     Followers,
 }

@@ -1,6 +1,6 @@
 //! Twitch GraphQL / HTTP client.
 
-use std::{sync::Mutex, time::Duration};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
@@ -211,6 +211,29 @@ impl Twitch {
             .into_iter()
             .map(|r| r.and_then(|resp| parse_channel_id(&resp)))
             .collect()
+    }
+
+    /// The current login of each channel id, 100 ids per request. Deleted or banned channels
+    /// are missing from the result.
+    pub async fn logins_by_id(&self, ids: &[String]) -> Result<HashMap<String, String>> {
+        let mut logins = HashMap::new();
+        for chunk in ids.chunks(100) {
+            let resp = self
+                .gql(&json!({
+                    "query": "query($ids: [ID!]) { users(ids: $ids) { id login } }",
+                    "variables": { "ids": chunk },
+                }))
+                .await?;
+            let users = resp["data"]["users"]
+                .as_array()
+                .ok_or_else(|| anyhow!("unexpected response: {resp}"))?;
+            for user in users {
+                if let (Some(id), Some(login)) = (user["id"].as_str(), user["login"].as_str()) {
+                    logins.insert(id.to_string(), login.to_lowercase());
+                }
+            }
+        }
+        Ok(logins)
     }
 
     /// `Ok(None)` means the channel is offline.

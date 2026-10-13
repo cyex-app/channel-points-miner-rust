@@ -2,7 +2,7 @@
 
 A Rust port of [Twitch-Channel-Points-Miner-v2](https://github.com/Tkd-Alex/Twitch-Channel-Points-Miner-v2)
 (with the fixes from the maintained [rdavydov fork](https://github.com/rdavydov/Twitch-Channel-Points-Miner-v2)),
-plus a small web UI for adding and removing channels while it runs.
+plus a small web UI for adding, removing and reordering channels while it runs.
 
 ## Run
 
@@ -26,15 +26,31 @@ browser stays logged in. If the token leaks, click **Regenerate login token** un
 get a new token, and every other browser is logged out. Deleting `web_token` and restarting also makes a new one.
 Scripts can send the token as `Authorization: Bearer <token>`.
 
-Channels added or removed in the UI are written back to the
-`streamers` list in `config.toml`, and your comments are kept. If you remove a channel that came from your
-follow list (`followers = true`), it is added to `blacklist` so it doesn't come back.
+### Channels
+
+Channels are stored in `miner.db` (SQLite) next to the config, keyed by their Twitch user id, so a channel
+that changes its name keeps its place, star and settings: logins are refreshed from the ids on every start
+(you'll see "x was renamed to y" in the log). On the first start, `streamers` and `blacklist` from
+`config.toml` are imported into the database; after that those lists are ignored and channels are managed in
+the web UI:
+
+- **Add** a channel by name or URL. It goes to the end of the list.
+- **Drag** the ⠿ handle to reorder (or focus it and use the arrow keys). Higher channels win when picking
+  what to watch for the `ORDER` priority, and when more than 2 starred channels are live.
+- **Star** a channel to always give it a watch slot while it's live.
+- **Remove** a channel. It's also blacklisted so it doesn't come back from your follow list; adding it again
+  un-blacklists it.
+
+With `followers = true`, new follows are added to the end of the list on each start and unfollowed channels
+are dropped. Per-channel overrides imported from the config (`follow_raid`, `chat`, ...) are kept in the
+database's `settings` column.
 
 Log verbosity: `RUST_LOG=points_miner=debug`.
 
 ## Docker
 
-Everything the miner stores (`config.toml`, `web_token`, `cookies/`) goes in `./data`, mounted at `/data`.
+Everything the miner stores (`config.toml`, `miner.db`, `web_token`, `cookies/`) goes in `./data`, mounted at
+`/data`.
 
 ```sh
 mkdir data

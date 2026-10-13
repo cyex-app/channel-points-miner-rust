@@ -3,4 +3,5 @@
 config.toml
 /data
 web_token
+miner.db*
 config-*.toml

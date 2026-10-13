@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::{sync::mpsc, time::Instant};
@@ -12,12 +12,13 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chat::ChatManager,
-    config::{Config, ConfigStore, Priority},
+    config::{merge_settings, Config, Priority},
     entities::{
         drops::{Campaign, Drop},
-        streamer::{ChatPresence, Source, Streamer, StreamerSettings},
+        streamer::{ChatPresence, Source, Streamer},
     },
     pubsub::{PubSubMessage, PubSubPool},
+    store::{ChannelRow, Store},
     twitch::{PointsContext, StreamInfo, Twitch},
     utils::{millify, now, random_between},
 };
@@ -34,7 +35,7 @@ pub struct LogEvent {
 pub struct Miner {
     pub twitch: Twitch,
     pub config: Config,
-    store: ConfigStore,
+    store: Store,
     streamers: RwLock<Vec<Arc<Streamer>>>,
     pubsub: PubSubPool,
     chat: ChatManager,
@@ -51,7 +52,7 @@ impl Miner {
     pub fn new(
         twitch: Twitch,
         config: Config,
-        store: ConfigStore,
+        store: Store,
         pubsub_messages: mpsc::UnboundedSender<String>,
     ) -> Self {
         let token = twitch.creds.auth_token.clone();
@@ -108,52 +109,206 @@ impl Miner {
             self.claim_all_drops_from_inventory().await;
         }
 
-        // (username, settings, source, channel id if already known)
-        let mut entries: Vec<(String, StreamerSettings, Source, Option<String>)> = Vec::new();
-        for entry in &self.config.streamers {
-            match entry.settings(&self.config.streamer_defaults) {
-                Ok(settings) => entries.push((entry.username(), settings, Source::Config, None)),
-                Err(e) => warn!("{e:#}"),
-            }
-        }
+        self.import_config().await;
         if self.config.followers {
-            match self.twitch.followers(self.config.followers_order).await {
-                Ok(follows) => {
-                    self.event(format!("Loaded {} followed channels from your profile", follows.len()));
-                    for (name, id) in follows {
-                        if !self.config.blacklist.contains(&name) {
-                            entries.push((name, self.config.streamer_defaults.clone(), Source::Followers, id));
-                        }
-                    }
-                }
-                Err(e) => warn!("Could not load followed channels: {e:#}"),
+            if let Err(e) = self.sync_followers().await {
+                warn!("Could not load followed channels: {e:#}");
             }
         }
-        let mut seen = HashSet::new();
-        entries.retain_mut(|(name, ..)| match normalize_login(name) {
-            Ok(normalized) => {
-                *name = normalized;
-                seen.insert(name.clone())
-            }
+        let mut rows: Vec<ChannelRow> = match self.store.channels() {
+            Ok(rows) => rows,
             Err(e) => {
-                warn!("Skipping {name}: {e:#}");
-                false
+                warn!("Could not read the channel list from the database: {e:#}");
+                Vec::new()
             }
-        });
-        self.load_streamers(entries).await;
+        };
+        // Followed channels keep their place in the list while `followers` is off, but aren't mined.
+        rows.retain(|r| self.config.followers || r.source != Source::Followers);
+        self.refresh_logins(&mut rows).await;
+        self.load_streamers(rows).await;
 
         tokio::spawn(self.clone().watch_loop());
         tokio::spawn(self.clone().campaigns_loop());
         tokio::spawn(self.clone().refresh_context_loop());
     }
 
-    pub async fn add_streamer(
-        &self,
-        username: &str,
-        settings: StreamerSettings,
-        source: Source,
-        persist: bool,
-    ) -> Result<Arc<Streamer>> {
+    /// One-time import of the `streamers` and `blacklist` lists from config.toml into the database.
+    async fn import_config(&self) {
+        const KEY: &str = "config_imported";
+        match self.store.meta(KEY) {
+            Ok(Some(_)) => {
+                if !self.config.streamers.is_empty() || !self.config.blacklist.is_empty() {
+                    warn!(
+                        "`streamers` and `blacklist` in config.toml are no longer used: channels are kept in \
+                         miner.db and managed in the web UI"
+                    );
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => return warn!("Could not read the database: {e:#}"),
+        }
+
+        // (login, per-channel overrides, prioritized)
+        let mut entries: Vec<(String, Value, bool)> = Vec::new();
+        for entry in &self.config.streamers {
+            let login = match normalize_login(&entry.username()) {
+                Ok(login) => login,
+                Err(e) => {
+                    warn!("Not importing {}: {e:#}", entry.username());
+                    continue;
+                }
+            };
+            let mut overrides = match entry.settings(&self.config.streamer_defaults).and_then(|_| entry.overrides()) {
+                Ok(overrides) => overrides,
+                Err(e) => {
+                    warn!("Importing {login} with the default settings: {e:#}");
+                    json!({})
+                }
+            };
+            let prioritized = overrides
+                .as_object_mut()
+                .and_then(|o| o.remove("prioritize"))
+                .and_then(|p| p.as_bool())
+                .unwrap_or(self.config.streamer_defaults.prioritize);
+            entries.push((login, overrides, prioritized));
+        }
+        let blacklist: Vec<String> = self
+            .config
+            .blacklist
+            .iter()
+            .filter_map(|name| normalize_login(name).ok())
+            .collect();
+        if entries.is_empty() && blacklist.is_empty() {
+            let _ = self.store.set_meta(KEY, "1");
+            return;
+        }
+
+        let logins: Vec<String> = entries.iter().map(|(login, ..)| login.clone()).chain(blacklist.clone()).collect();
+        let mut ids = self.twitch.channel_ids(&logins).await.into_iter();
+        let mut complete = true;
+        let mut imported = 0;
+        for (login, overrides, prioritized) in &entries {
+            match ids.next() {
+                Some(Ok(Some(id))) => match self.store.add_channel(&id, login, Source::Manual, *prioritized, overrides) {
+                    Ok(()) => imported += 1,
+                    Err(e) => {
+                        complete = false;
+                        warn!("Could not import {login}: {e:#}");
+                    }
+                },
+                Some(Ok(None)) => warn!("Not importing {login}: channel does not exist"),
+                Some(Err(e)) => {
+                    complete = false;
+                    warn!("Could not import {login}: {e:#}");
+                }
+                None => complete = false,
+            }
+        }
+        for login in &blacklist {
+            match ids.next() {
+                Some(Ok(Some(id))) => {
+                    if let Err(e) = self.store.add_to_blacklist(&id, login) {
+                        complete = false;
+                        warn!("Could not import {login} into the blacklist: {e:#}");
+                    }
+                }
+                Some(Ok(None)) => {}
+                Some(Err(e)) => {
+                    complete = false;
+                    warn!("Could not import {login} into the blacklist: {e:#}");
+                }
+                None => complete = false,
+            }
+        }
+        if complete {
+            let _ = self.store.set_meta(KEY, "1");
+            self.event(format!(
+                "Imported {imported} channels from config.toml into miner.db. Channels are now managed in the web \
+                 UI; `streamers` and `blacklist` in config.toml are no longer used."
+            ));
+        } else {
+            warn!("Some channels could not be imported from config.toml; retrying on the next start");
+        }
+    }
+
+    /// Adds newly followed channels to the end of the list and drops unfollowed ones.
+    async fn sync_followers(&self) -> Result<()> {
+        let follows = self.twitch.followers(self.config.followers_order).await?;
+        let missing: Vec<String> = follows
+            .iter()
+            .filter(|(_, id)| id.is_none())
+            .map(|(login, _)| login.clone())
+            .collect();
+        let mut resolved = self.twitch.channel_ids(&missing).await.into_iter();
+        // Only drop unfollowed channels if every follow could be matched to an id.
+        let mut complete = true;
+        let mut followed: Vec<(String, String)> = Vec::new();
+        for (login, id) in follows {
+            let id = match id {
+                Some(id) => Some(id),
+                None => match resolved.next() {
+                    Some(Ok(id)) => id,
+                    _ => {
+                        complete = false;
+                        None
+                    }
+                },
+            };
+            if let Some(id) = id {
+                followed.push((login, id));
+            }
+        }
+
+        let blacklist = self.store.blacklist()?;
+        let existing: HashMap<String, Source> =
+            self.store.channels()?.into_iter().map(|r| (r.id, r.source)).collect();
+        let no_overrides = json!({});
+        let mut added = 0;
+        for (login, id) in &followed {
+            if !blacklist.contains(id) && !existing.contains_key(id) {
+                self.store.add_channel(id, login, Source::Followers, false, &no_overrides)?;
+                added += 1;
+            }
+        }
+        let mut removed = 0;
+        if complete {
+            let followed_ids: HashSet<&String> = followed.iter().map(|(_, id)| id).collect();
+            for (id, source) in &existing {
+                if *source == Source::Followers && !followed_ids.contains(id) {
+                    self.store.remove_channel(id)?;
+                    removed += 1;
+                }
+            }
+        }
+        self.event(format!(
+            "Loaded {} followed channels from your profile ({added} new, {removed} unfollowed)",
+            followed.len()
+        ));
+        Ok(())
+    }
+
+    /// Updates stored logins from the channel ids, so renamed channels keep working.
+    async fn refresh_logins(&self, rows: &mut [ChannelRow]) {
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let logins = match self.twitch.logins_by_id(&ids).await {
+            Ok(logins) => logins,
+            Err(e) => return warn!("Could not check for renamed channels: {e:#}"),
+        };
+        for row in rows.iter_mut() {
+            let Some(login) = logins.get(&row.id) else { continue };
+            if *login != row.login {
+                self.event(format!("{} was renamed to {login}", row.login));
+                if let Err(e) = self.store.set_login(&row.id, login) {
+                    warn!("Could not save the new name of {login}: {e:#}");
+                }
+                row.login = login.clone();
+            }
+        }
+    }
+
+    /// Adds a channel by name (from the web UI) to the end of the list.
+    pub async fn add_streamer(&self, username: &str) -> Result<Arc<Streamer>> {
         let username = normalize_login(username)?;
         if self.streamers.read().unwrap().iter().any(|s| s.username == username) {
             bail!("{username} is already being mined");
@@ -161,74 +316,69 @@ impl Miner {
         if !self.adding.lock().unwrap().insert(username.clone()) {
             bail!("{username} is already being added");
         }
-        let result = self.add_streamer_inner(&username, settings, source, persist).await;
+        let result = self.add_streamer_inner(&username).await;
         self.adding.lock().unwrap().remove(&username);
         result
     }
 
-    async fn add_streamer_inner(
-        &self,
-        username: &str,
-        settings: StreamerSettings,
-        source: Source,
-        persist: bool,
-    ) -> Result<Arc<Streamer>> {
+    async fn add_streamer_inner(&self, username: &str) -> Result<Arc<Streamer>> {
         let channel_id = self
             .twitch
             .get_channel_id(username)
             .await?
             .ok_or_else(|| anyhow!("streamer {username} does not exist"))?;
-        let streamer = Arc::new(Streamer::new(username.to_string(), channel_id, settings, source));
+        if self.find_by_channel(&channel_id).is_some() {
+            bail!("{username} is already being mined");
+        }
+        let settings = self.config.streamer_defaults.clone();
+        self.store
+            .add_channel(&channel_id, username, Source::Manual, settings.prioritize, &json!({}))
+            .context("could not save the channel")?;
+        if let Err(e) = self.store.remove_from_blacklist(&channel_id) {
+            warn!("Could not remove {username} from the blacklist: {e:#}");
+        }
+
+        let streamer = Arc::new(Streamer::new(username.to_string(), channel_id, settings, Source::Manual));
         self.init_streamers(std::slice::from_ref(&streamer)).await;
         self.register(&streamer);
-
-        if persist {
-            if let Err(e) = self.store.add_streamer(username) {
-                warn!("Could not save {username} to the config file: {e:#}");
-            }
-            self.event(format!("Added {streamer}"));
-        }
+        // A channel that was already in the database (e.g. followed) keeps its old place.
+        self.sort_by_store_order();
+        self.event(format!("Added {streamer}"));
         Ok(streamer)
     }
 
-    /// Loads the startup streamers with batched requests: one round for channel ids, one for
-    /// points + live status, one for drop campaigns of live channels.
-    async fn load_streamers(&self, mut entries: Vec<(String, StreamerSettings, Source, Option<String>)>) {
-        // Reserve the names so a web UI add can't load the same streamer meanwhile.
-        let reserved: Vec<String> = {
-            let existing: HashSet<String> = self.streamers().iter().map(|s| s.username.clone()).collect();
+    /// Loads the streamers from the database with batched requests: one round for points + live
+    /// status, one for drop campaigns of live channels.
+    async fn load_streamers(&self, rows: Vec<ChannelRow>) {
+        let mut streamers = Vec::with_capacity(rows.len());
+        {
+            // Reserve the names so a web UI add can't load the same streamer meanwhile.
+            let existing: HashSet<String> = self.streamers().iter().map(|s| s.channel_id.clone()).collect();
             let mut adding = self.adding.lock().unwrap();
-            entries.retain(|(name, ..)| !existing.contains(name) && adding.insert(name.clone()));
-            entries.iter().map(|(name, ..)| name.clone()).collect()
-        };
-        self.event(format!("Loading data for {} streamers. Please wait...", entries.len()));
-
-        let unknown: Vec<String> = entries
-            .iter()
-            .filter(|(.., id)| id.is_none())
-            .map(|(name, ..)| name.clone())
-            .collect();
-        let mut ids = self.twitch.channel_ids(&unknown).await.into_iter();
-        let mut streamers = Vec::with_capacity(entries.len());
-        for (name, settings, source, id) in entries {
-            let id = match id {
-                Some(id) => Ok(Some(id)),
-                None => ids.next().unwrap_or_else(|| Err(anyhow!("no channel id returned"))),
-            };
-            match id {
-                Ok(Some(id)) => streamers.push(Arc::new(Streamer::new(name, id, settings, source))),
-                Ok(None) => warn!("Skipping {name}: streamer does not exist"),
-                Err(e) => warn!("Skipping {name}: {e:#}"),
+            for row in rows {
+                if existing.contains(&row.id) || !adding.insert(row.login.clone()) {
+                    continue;
+                }
+                let mut settings = match merge_settings(&self.config.streamer_defaults, &row.settings) {
+                    Ok(settings) => settings,
+                    Err(e) => {
+                        warn!("Invalid settings for {} in the database, using the defaults: {e:#}", row.login);
+                        self.config.streamer_defaults.clone()
+                    }
+                };
+                settings.prioritize = row.prioritized;
+                streamers.push(Arc::new(Streamer::new(row.login, row.id, settings, row.source)));
             }
         }
+        self.event(format!("Loading data for {} streamers. Please wait...", streamers.len()));
 
         self.init_streamers(&streamers).await;
         for streamer in &streamers {
             self.register(streamer);
         }
         let mut adding = self.adding.lock().unwrap();
-        for name in &reserved {
-            adding.remove(name);
+        for streamer in &streamers {
+            adding.remove(&streamer.username);
         }
     }
 
@@ -285,46 +435,40 @@ impl Miner {
         self.update_chat(streamer);
     }
 
-    pub fn remove_streamer(&self, username: &str) -> Result<()> {
-        let username = username.trim().to_lowercase();
+    /// Stops mining a channel and removes it from the list. It's also blacklisted, so it doesn't
+    /// come back from the follow list; adding it again un-blacklists it.
+    pub fn remove_streamer(&self, channel_id: &str) -> Result<()> {
         let streamer = {
             let mut list = self.streamers.write().unwrap();
             let pos = list
                 .iter()
-                .position(|s| s.username == username)
-                .ok_or_else(|| anyhow!("{username} is not being mined"))?;
+                .position(|s| s.channel_id == channel_id)
+                .ok_or_else(|| anyhow!("channel {channel_id} is not being mined"))?;
             list.remove(pos)
         };
         for topic in channel_topics(&streamer) {
             self.pubsub.remove(&topic);
         }
-        self.chat.leave(&username);
+        self.chat.leave(&streamer.username);
 
-        // A followed channel may also be in `streamers` if it was prioritized.
-        let saved = match streamer.source {
-            Source::Config => self.store.remove_streamer(&username),
-            Source::Followers => self
-                .store
-                .remove_streamer(&username)
-                .and_then(|_| self.store.add_to_blacklist(&username)),
-        };
+        let saved = self
+            .store
+            .remove_channel(channel_id)
+            .and_then(|_| self.store.add_to_blacklist(channel_id, &streamer.username));
         if let Err(e) = saved {
-            warn!("Could not update the config file: {e:#}");
+            warn!("Could not update the database: {e:#}");
         }
         self.event(format!("Removed {streamer}"));
         Ok(())
     }
 
-    pub fn set_prioritized(&self, username: &str, prioritized: bool) -> Result<Arc<Streamer>> {
-        let username = username.trim().to_lowercase();
+    pub fn set_prioritized(&self, channel_id: &str, prioritized: bool) -> Result<Arc<Streamer>> {
         let streamer = self
-            .streamers()
-            .into_iter()
-            .find(|s| s.username == username)
-            .ok_or_else(|| anyhow!("{username} is not being mined"))?;
+            .find_by_channel(channel_id)
+            .ok_or_else(|| anyhow!("channel {channel_id} is not being mined"))?;
         streamer.state().prioritized = prioritized;
-        if let Err(e) = self.store.set_prioritize(&username, prioritized) {
-            warn!("Could not save the priority of {username} to the config file: {e:#}");
+        if let Err(e) = self.store.set_prioritized(channel_id, prioritized) {
+            warn!("Could not save the priority of {}: {e:#}", streamer.username);
         }
         self.event(if prioritized {
             format!("Prioritized {streamer}: it gets a watch slot whenever it's live")
@@ -332,6 +476,27 @@ impl Miner {
             format!("{streamer} is no longer prioritized")
         });
         Ok(streamer)
+    }
+
+    /// Saves a new list order (channel ids, most important first). Channels not in `ids` keep
+    /// their relative order after the given ones.
+    pub fn reorder(&self, ids: &[String]) -> Result<()> {
+        self.store.reorder(ids)?;
+        self.sort_by_store_order();
+        Ok(())
+    }
+
+    /// Sorts the in-memory list like the database, which the `ORDER` priority relies on.
+    fn sort_by_store_order(&self) {
+        let rows = match self.store.channels() {
+            Ok(rows) => rows,
+            Err(e) => return warn!("Could not read the channel order: {e:#}"),
+        };
+        let index: HashMap<&str, usize> = rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), i)).collect();
+        self.streamers
+            .write()
+            .unwrap()
+            .sort_by_key(|s| index.get(s.channel_id.as_str()).copied().unwrap_or(usize::MAX));
     }
 
     // === Online state === //

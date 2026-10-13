@@ -18,7 +18,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/points-miner /usr/local/bin/points-miner
 
-# config.toml, web_token and cookies/ all live in /data.
+# config.toml, miner.db, web_token and cookies/ all live in /data.
 VOLUME /data
 WORKDIR /data
 ENV POINTS_MINER_WEB_HOST=0.0.0.0

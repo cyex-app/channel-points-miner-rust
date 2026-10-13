@@ -94,8 +94,9 @@ pub async fn serve(state: Arc<AppState>, host: &str, port: u16) -> Result<()> {
     let protected = Router::new()
         .route("/api/status", get(status))
         .route("/api/streamers", post(add_streamer))
-        .route("/api/streamers/:username", delete(remove_streamer))
-        .route("/api/streamers/:username/prioritize", put(set_prioritize))
+        .route("/api/streamers/order", put(reorder))
+        .route("/api/streamers/:id", delete(remove_streamer))
+        .route("/api/streamers/:id/prioritize", put(set_prioritize))
         .route("/api/auth/regenerate", post(regenerate_token))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let app = Router::new()
@@ -173,6 +174,7 @@ async fn index() -> Html<&'static str> {
 
 #[derive(Serialize)]
 struct StreamerView {
+    id: String,
     username: String,
     source: Source,
     online: bool,
@@ -191,6 +193,7 @@ impl StreamerView {
     fn new(s: &Streamer) -> Self {
         let st = s.state();
         Self {
+            id: s.channel_id.clone(),
             username: s.username.clone(),
             source: s.source,
             online: st.is_online,
@@ -252,21 +255,17 @@ async fn add_streamer(State(state): State<Arc<AppState>>, Json(body): Json<AddSt
     let Some(miner) = state.miner.get() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "The miner is still logging in");
     };
-    let settings = miner.config.streamer_defaults.clone();
-    match miner
-        .add_streamer(&body.username, settings, Source::Config, true)
-        .await
-    {
+    match miner.add_streamer(&body.username).await {
         Ok(streamer) => Json(StreamerView::new(&streamer)).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
 }
 
-async fn remove_streamer(State(state): State<Arc<AppState>>, Path(username): Path<String>) -> Response {
+async fn remove_streamer(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let Some(miner) = state.miner.get() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "The miner is still logging in");
     };
-    match miner.remove_streamer(&username) {
+    match miner.remove_streamer(&id) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, format!("{e:#}")),
     }
@@ -279,14 +278,30 @@ struct SetPrioritize {
 
 async fn set_prioritize(
     State(state): State<Arc<AppState>>,
-    Path(username): Path<String>,
+    Path(id): Path<String>,
     Json(body): Json<SetPrioritize>,
 ) -> Response {
     let Some(miner) = state.miner.get() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "The miner is still logging in");
     };
-    match miner.set_prioritized(&username, body.prioritize) {
+    match miner.set_prioritized(&id, body.prioritize) {
         Ok(streamer) => Json(StreamerView::new(&streamer)).into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, format!("{e:#}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct Reorder {
+    /// Channel ids, most important first.
+    ids: Vec<String>,
+}
+
+async fn reorder(State(state): State<Arc<AppState>>, Json(body): Json<Reorder>) -> Response {
+    let Some(miner) = state.miner.get() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "The miner is still logging in");
+    };
+    match miner.reorder(&body.ids) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
 }

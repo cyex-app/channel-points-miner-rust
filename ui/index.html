@@ -62,6 +62,20 @@
   button.star:hover { color: var(--star); }
   button.star.on { color: var(--star); }
   .hint { margin: -4px 0 10px; font-size: 12px; }
+  td.grip { width: 28px; padding-left: 2px; padding-right: 0; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .panel-head h2 { margin: 0; }
+  button.lock { padding: 4px 10px; font-size: 12px; }
+  button.lock[aria-pressed="false"] { border-color: var(--accent); color: var(--accent); }
+  #channels.locked .grip { display: none; }
+  button.handle { background: transparent; color: var(--muted); border: 0; padding: 2px 4px; font-size: 16px; line-height: 1.2;
+    font-weight: 400; cursor: grab; touch-action: none; border-radius: 6px; }
+  button.handle:hover, button.handle:focus-visible { color: var(--text); background: var(--row-hover); }
+  tbody tr.dragging { position: relative; z-index: 2; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); }
+  tbody tr.dragging td { background: var(--panel); }
+  tbody tr.dragging button.handle { cursor: grabbing; color: var(--accent); }
+  body.is-dragging { cursor: grabbing; user-select: none; -webkit-user-select: none; }
+  body.is-dragging tbody tr:hover { background: transparent; }
   .warn { color: var(--star); }
   .empty { text-align: center; color: var(--muted); padding: 24px; }
   #events { max-height: 340px; overflow-y: auto; font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; }
@@ -120,13 +134,17 @@
       <div id="add-msg" class="msg"></div>
     </section>
 
-    <section class="panel">
-      <h2>Channels</h2>
-      <p class="hint muted" id="prio-hint">Star a channel to prioritize it (e.g. for a watch-time badge). Prioritized
-        channels get one of the 2 watch slots whenever they're live, before streaks and drops.</p>
+    <section class="panel" id="channels">
+      <div class="panel-head">
+        <h2>Channels</h2>
+        <button class="secondary lock" id="lock-btn" type="button"></button>
+      </div>
+      <p class="hint muted" id="prio-hint">Unlock the order, then drag ⠿ to reorder: channels higher in the list are watched first (after
+        streaks and drops, as set by <code>priority</code> in the config). Star a channel to always give it one of the
+        2 watch slots while it's live, e.g. for a watch-time badge.</p>
       <table>
         <thead><tr>
-          <th>Channel</th><th class="num">Points</th><th class="num">Session</th>
+          <th class="grip"></th><th>Channel</th><th class="num">Points</th><th class="num">Session</th>
           <th class="num hide-sm">Watched</th><th></th>
         </tr></thead>
         <tbody id="rows"></tbody>
@@ -163,6 +181,11 @@ let lastEventTs = -1;
 const PRIO_HINT = $("prio-hint").textContent;
 
 let authed = null;
+let drag = null;          // the row being dragged, see startDrag()
+let savingOrder = false;
+// Reordering is locked by default (remembered per browser), so a stray drag can't change the order.
+let orderLocked = true;
+try { orderLocked = localStorage.getItem("orderLocked") !== "0"; } catch {}
 
 function showAuth() {
   if (authed !== false) {
@@ -202,10 +225,16 @@ function normalize(input) {
 }
 
 function renderRows(streamers) {
+  // Don't re-render under the user's pointer; the next refresh after the drop catches up.
+  if (drag || savingOrder) return;
   if (!streamers.length) {
-    $("rows").innerHTML = '<tr><td colspan="5" class="empty">No channels yet. Add one above.</td></tr>';
+    $("rows").innerHTML = '<tr><td colspan="6" class="empty">No channels yet. Add one above.</td></tr>';
     return;
   }
+  // Re-rendering replaces the buttons; keep keyboard focus on the same one.
+  const focused = document.activeElement?.closest("#rows button");
+  const focusedRow = focused?.closest("tr")?.dataset.id;
+  const focusedKind = focused?.classList[0];
   $("rows").innerHTML = streamers.map((s) => {
     const badges = (s.online ? '<span class="badge live">LIVE</span>' : "")
       + (s.prioritized ? '<span class="badge prio">priority</span>' : "")
@@ -216,9 +245,10 @@ function renderRows(streamers) {
       : "Offline";
     const history = Object.entries(s.history).filter(([, h]) => h.counter)
       .map(([k, h]) => `${k} ×${h.counter} (${signed(h.amount)})`).join(", ");
-    return `<tr title="${esc(history)}">
+    return `<tr title="${esc(history)}" data-id="${esc(s.id)}">
+      <td class="grip"><button class="handle" title="Drag to reorder" aria-label="Move ${esc(s.username)} (arrow keys)">⠿</button></td>
       <td><div class="name-row">
-          <button class="star ${s.prioritized ? "on" : ""}" data-user="${esc(s.username)}" data-on="${s.prioritized ? 1 : 0}"
+          <button class="star ${s.prioritized ? "on" : ""}" data-id="${esc(s.id)}" data-on="${s.prioritized ? 1 : 0}"
             title="${s.prioritized ? "Stop prioritizing" : "Prioritize: always watch when live"}"
             aria-label="${s.prioritized ? "Stop prioritizing" : "Prioritize"} ${esc(s.username)}">${s.prioritized ? "★" : "☆"}</button>
           <div><div class="name"><a href="https://www.twitch.tv/${esc(s.username)}" target="_blank" rel="noopener">${esc(s.username)}</a>${badges}</div>
@@ -226,9 +256,12 @@ function renderRows(streamers) {
       <td class="num">${fmt(s.points)}</td>
       <td class="num ${s.gained > 0 ? "gain" : ""}">${signed(s.gained)}</td>
       <td class="num hide-sm">${s.online ? Math.floor(s.minutes_watched) + "m" : "–"}</td>
-      <td class="num"><button class="remove" data-user="${esc(s.username)}">Remove</button></td>
+      <td class="num"><button class="remove" data-id="${esc(s.id)}">Remove</button></td>
     </tr>`;
   }).join("");
+  if (focusedRow && focusedKind) {
+    $("rows").querySelector(`tr[data-id="${CSS.escape(focusedRow)}"] button.${focusedKind}`)?.focus();
+  }
 }
 
 function renderEvents(events) {
@@ -312,7 +345,7 @@ $("rows").addEventListener("click", async (ev) => {
   const star = ev.target.closest("button.star");
   if (star) {
     star.disabled = true;
-    const res = await api("api/streamers/" + encodeURIComponent(star.dataset.user) + "/prioritize", {
+    const res = await api("api/streamers/" + encodeURIComponent(star.dataset.id) + "/prioritize", {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ prioritize: star.dataset.on !== "1" }),
     }).catch(() => null);
@@ -326,14 +359,13 @@ $("rows").addEventListener("click", async (ev) => {
   }
   const btn = ev.target.closest("button.remove");
   if (!btn) return;
-  const user = btn.dataset.user;
   if (btn.dataset.confirm !== "1") {
     btn.dataset.confirm = "1"; btn.textContent = "Confirm?";
     setTimeout(() => { btn.dataset.confirm = ""; btn.textContent = "Remove"; }, 3000);
     return;
   }
   btn.disabled = true;
-  const res = await api("api/streamers/" + encodeURIComponent(user), { method: "DELETE" }).catch(() => null);
+  const res = await api("api/streamers/" + encodeURIComponent(btn.dataset.id), { method: "DELETE" }).catch(() => null);
   if (!res) return;
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -341,6 +373,152 @@ $("rows").addEventListener("click", async (ev) => {
   }
   refresh();
 });
+
+// === Drag to reorder === //
+// Pointer events (not HTML5 drag & drop) so it works with mouse, pen and touch alike. The dragged
+// row follows the pointer; the others slide out of the way (FLIP animation).
+
+const rowsEl = $("rows");
+const rowOrder = () => [...rowsEl.children].map((r) => r.dataset.id).filter(Boolean);
+
+// Where the layout puts a row (viewport y), ignoring its drag/animation transform. Not offsetTop:
+// the dragged row is position: relative, which changes its offsetParent from the table to <body>.
+function layoutTop(r) {
+  const t = getComputedStyle(r).transform;
+  return r.getBoundingClientRect().top - (t === "none" ? 0 : new DOMMatrixReadOnly(t).m42);
+}
+
+// Moves `row` before `before` (null = to the end), animating the rows that shift.
+function moveRow(row, before) {
+  const others = [...rowsEl.children].filter((r) => r !== row);
+  const firstTop = new Map(others.map((r) => [r, r.getBoundingClientRect().top]));
+  rowsEl.insertBefore(row, before);
+  for (const r of others) {
+    const dy = firstTop.get(r) - layoutTop(r);
+    if (Math.abs(dy) < 1) continue;
+    r.style.transition = "none";
+    r.style.transform = `translateY(${dy}px)`;
+    r.getBoundingClientRect(); // apply the start position before animating back
+    r.style.transition = "transform 160ms ease";
+    r.style.transform = "";
+  }
+}
+
+function startDrag(ev, handle) {
+  const row = handle.closest("tr");
+  ev.preventDefault();
+  handle.setPointerCapture(ev.pointerId);
+  drag = {
+    row, pointerId: ev.pointerId, y: ev.clientY,
+    grabY: ev.clientY - row.getBoundingClientRect().top,
+    startOrder: rowOrder().join(),
+  };
+  row.style.transition = "none";
+  row.classList.add("dragging");
+  document.body.classList.add("is-dragging");
+  drag.scrollTimer = setInterval(autoScroll, 16);
+}
+
+function followPointer() {
+  const { row } = drag;
+  const top = drag.y - drag.grabY;              // where the dragged row's top should be
+  const center = top + row.offsetHeight / 2;
+  // Insert before the first other row whose middle (by layout, ignoring animations) is below the center.
+  const before = [...rowsEl.children].find((r) =>
+    r !== row && center < layoutTop(r) + r.offsetHeight / 2) ?? null;
+  let next = row.nextElementSibling;
+  if (next === row) next = next.nextElementSibling;
+  if (before !== next) moveRow(row, before);
+  row.style.transform = `translateY(${top - layoutTop(row)}px)`;
+}
+
+// Scrolls the page while the pointer is near the top or bottom edge.
+function autoScroll() {
+  const edge = 70, h = window.innerHeight;
+  let speed = 0;
+  if (drag.y < edge) speed = -Math.ceil((edge - drag.y) / 5);
+  else if (drag.y > h - edge) speed = Math.ceil((drag.y - (h - edge)) / 5);
+  if (speed) {
+    window.scrollBy(0, speed);
+    followPointer();
+  }
+}
+
+async function saveOrder() {
+  savingOrder = true;
+  try {
+    const res = await api("api/streamers/order", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: rowOrder() }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Saving the order failed");
+  } catch (e) {
+    $("add-msg").className = "msg err"; $("add-msg").textContent = e.message;
+  } finally {
+    savingOrder = false;
+    refresh();
+  }
+}
+
+function endDrag(cancelled) {
+  const { row, startOrder } = drag;
+  clearInterval(drag.scrollTimer);
+  drag = null;
+  document.body.classList.remove("is-dragging");
+  row.classList.remove("dragging");
+  row.style.transition = "transform 160ms ease"; // settle into its slot
+  row.style.transform = "";
+  setTimeout(() => {
+    for (const r of rowsEl.children) r.style.transition = "";
+  }, 200);
+  if (cancelled || rowOrder().join() === startOrder) {
+    refresh();
+  } else {
+    saveOrder();
+  }
+}
+
+rowsEl.addEventListener("pointerdown", (ev) => {
+  const handle = ev.target.closest("button.handle");
+  if (handle && ev.button === 0 && !orderLocked && !drag && !savingOrder) startDrag(ev, handle);
+});
+rowsEl.addEventListener("pointermove", (ev) => {
+  if (!drag || ev.pointerId !== drag.pointerId) return;
+  drag.y = ev.clientY;
+  followPointer();
+});
+rowsEl.addEventListener("pointerup", (ev) => {
+  if (drag && ev.pointerId === drag.pointerId) endDrag(false);
+});
+rowsEl.addEventListener("pointercancel", (ev) => {
+  if (drag && ev.pointerId === drag.pointerId) endDrag(true);
+});
+// Keyboard: focus the handle and use the arrow keys.
+rowsEl.addEventListener("keydown", (ev) => {
+  const handle = ev.target.closest("button.handle");
+  if (!handle || orderLocked || drag || savingOrder || (ev.key !== "ArrowUp" && ev.key !== "ArrowDown")) return;
+  ev.preventDefault();
+  const row = handle.closest("tr");
+  const target = ev.key === "ArrowUp" ? row.previousElementSibling : row.nextElementSibling?.nextElementSibling ?? null;
+  if (ev.key === "ArrowUp" && !target) return;
+  if (ev.key === "ArrowDown" && !row.nextElementSibling) return;
+  moveRow(row, target);
+  handle.focus();
+  saveOrder();
+});
+
+function applyLock() {
+  const btn = $("lock-btn");
+  $("channels").classList.toggle("locked", orderLocked);
+  btn.textContent = orderLocked ? "🔒 Order locked" : "🔓 Order unlocked";
+  btn.title = orderLocked ? "Unlock to reorder channels by dragging" : "Lock the order so it can't be changed by accident";
+  btn.setAttribute("aria-pressed", String(orderLocked));
+}
+$("lock-btn").addEventListener("click", () => {
+  orderLocked = !orderLocked;
+  try { localStorage.setItem("orderLocked", orderLocked ? "1" : "0"); } catch {}
+  applyLock();
+});
+applyLock();
 
 $("auth-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();

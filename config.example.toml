@@ -2,8 +2,10 @@
 # https://www.twitch.tv/activate (shown in the console and in the web UI).
 username = "lilb_lxryer"
 
-# Channels to mine, in priority order. Channels added/removed in the web UI are
-# written back to this list. Use a plain name, or a table for per-channel overrides:
+# Channels to mine, in priority order. They are imported ONCE, on the first start, into the
+# database (miner.db next to this file); after that, channels are managed in the web UI (add,
+# remove, drag to reorder, star) and this list is ignored. Use a plain name, or a table for
+# per-channel overrides:
 #   streamers = ["aussienatics", { username = "channel2", follow_raid = false, chat = "NEVER" }]
 # `prioritize = true` (or the star in the web UI) makes a channel always take one of the 2 watch
 # slots while it's live, ahead of `priority` below - handy for working towards a watch-time badge.
@@ -16,7 +18,9 @@ claim_drops_startup = false
 # ORDER, STREAK, DROPS, SUBSCRIBED, POINTS_ASCENDING, POINTS_DESCENDING
 priority = ["STREAK", "DROPS", "ORDER"]
 
-# Also mine every channel you follow (except the ones in `blacklist`).
+# Also mine every channel you follow. New follows are added to the end of the list on each start.
+# Channels removed in the web UI are blacklisted so they don't come back; `blacklist` here is only
+# imported on the first start, like `streamers`.
 followers = false
 followers_order = "ASC"
 blacklist = []
