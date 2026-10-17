@@ -104,6 +104,7 @@ pub async fn serve(state: Arc<AppState>, host: &str, port: u16) -> Result<()> {
         .route("/api/streamers/order", put(reorder))
         .route("/api/streamers/:id", delete(remove_streamer))
         .route("/api/streamers/:id/prioritize", put(set_prioritize))
+        .route("/api/settings/streak_first", put(set_streak_first))
         .route("/api/auth/regenerate", post(regenerate_token))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth));
     let app = Router::new()
@@ -224,6 +225,7 @@ struct Status {
     user: Option<String>,
     login_prompt: Option<LoginPrompt>,
     started_at: Option<f64>,
+    streak_first: bool,
     streamers: Vec<StreamerView>,
     /// Only in `/api/status`; the live stream sends events separately.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,6 +240,7 @@ fn snapshot(state: &AppState, with_events: bool) -> Status {
             user: Some(miner.twitch.creds.login.clone()),
             login_prompt,
             started_at: Some(miner.started_at),
+            streak_first: miner.streak_first(),
             streamers: miner.streamers().iter().map(|s| StreamerView::new(s)).collect(),
             events: with_events.then(|| miner.events()),
         },
@@ -246,6 +249,7 @@ fn snapshot(state: &AppState, with_events: bool) -> Status {
             user: None,
             login_prompt,
             started_at: None,
+            streak_first: false,
             streamers: Vec::new(),
             events: with_events.then(Vec::new),
         },
@@ -372,6 +376,19 @@ async fn set_prioritize(
         Ok(streamer) => Json(StreamerView::new(&streamer)).into_response(),
         Err(e) => error(StatusCode::NOT_FOUND, format!("{e:#}")),
     }
+}
+
+#[derive(Deserialize)]
+struct SetStreakFirst {
+    enabled: bool,
+}
+
+async fn set_streak_first(State(state): State<Arc<AppState>>, Json(body): Json<SetStreakFirst>) -> Response {
+    let Some(miner) = state.miner.get() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "The miner is still logging in");
+    };
+    miner.set_streak_first(body.enabled);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]

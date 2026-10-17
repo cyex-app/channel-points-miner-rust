@@ -68,6 +68,8 @@
   button.lock { padding: 4px 10px; font-size: 12px; }
   button.lock[aria-pressed="false"] { border-color: var(--accent); color: var(--accent); }
   #channels.locked .grip { display: none; }
+  .head-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  button.toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
   button.handle { background: transparent; color: var(--muted); border: 0; padding: 2px 4px; font-size: 16px; line-height: 1.2;
     font-weight: 400; cursor: grab; touch-action: none; border-radius: 6px; }
   button.handle:hover, button.handle:focus-visible { color: var(--text); background: var(--row-hover); }
@@ -137,7 +139,11 @@
     <section class="panel" id="channels">
       <div class="panel-head">
         <h2>Channels</h2>
-        <button class="secondary lock" id="lock-btn" type="button"></button>
+        <div class="head-actions">
+          <button class="secondary lock toggle" id="streak-btn" type="button" aria-pressed="false"
+            title="Streams missing their watch streak get a watch slot before everything else, even starred channels">🔥 Streaks first: off</button>
+          <button class="secondary lock" id="lock-btn" type="button"></button>
+        </div>
       </div>
       <p class="hint muted" id="prio-hint">Unlock the order, then drag ⠿ to reorder: channels higher in the list are watched first (after
         streaks and drops, as set by <code>priority</code> in the config). Star a channel to always give it one of the
@@ -322,6 +328,7 @@ function render(st) {
   $("s-points").textContent = fmt(st.streamers.reduce((a, s) => a + s.points, 0));
   $("s-gained").textContent = signed(st.streamers.reduce((a, s) => a + s.gained, 0));
   renderRows(st.streamers);
+  if (!$("streak-btn").disabled) renderStreakFirst(st.streak_first);
   const liveStarred = st.streamers.filter((s) => s.prioritized && s.online).length;
   const hint = $("prio-hint");
   hint.classList.toggle("warn", liveStarred > 2);
@@ -558,6 +565,29 @@ rowsEl.addEventListener("keydown", (ev) => {
   moveRow(row, target);
   handle.focus();
   saveOrder();
+});
+
+function renderStreakFirst(on) {
+  const btn = $("streak-btn");
+  btn.setAttribute("aria-pressed", String(on));
+  btn.textContent = `🔥 Streaks first: ${on ? "on" : "off"}`;
+}
+$("streak-btn").addEventListener("click", async () => {
+  const btn = $("streak-btn");
+  const enabled = btn.getAttribute("aria-pressed") !== "true";
+  btn.disabled = true;
+  try {
+    const res = await api("api/settings/streak_first", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Update failed");
+    renderStreakFirst(enabled);
+  } catch (e) {
+    $("add-msg").className = "msg err"; $("add-msg").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
 });
 
 function applyLock() {

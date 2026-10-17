@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     time::Duration,
 };
 
@@ -27,6 +30,8 @@ use crate::{
 };
 
 const MAX_WATCHING: usize = 2;
+/// `meta` key for the `streak_first` setting changed in the web UI, which overrides config.toml.
+const STREAK_FIRST_KEY: &str = "streak_first";
 /// Recent events kept for web UI clients that connect later.
 const MAX_EVENTS: usize = 50;
 
@@ -47,6 +52,8 @@ pub struct Miner {
     /// New events, pushed to connected web UI clients.
     events_tx: broadcast::Sender<LogEvent>,
     adding: Mutex<HashSet<String>>,
+    /// `streak_first` from config.toml, unless it was changed in the web UI.
+    streak_first: AtomicBool,
     pub started_at: f64,
 }
 
@@ -63,6 +70,14 @@ impl Miner {
     ) -> Self {
         let token = twitch.creds.auth_token.clone();
         let chat = ChatManager::new(twitch.creds.login.clone(), token.clone());
+        let streak_first = match store.meta(STREAK_FIRST_KEY) {
+            Ok(Some(v)) => v == "1",
+            Ok(None) => config.streak_first,
+            Err(e) => {
+                warn!("Could not read the streak_first setting: {e:#}");
+                config.streak_first
+            }
+        };
         Self {
             twitch,
             config,
@@ -73,6 +88,7 @@ impl Miner {
             events: Mutex::new(VecDeque::new()),
             events_tx: broadcast::channel(256).0,
             adding: Mutex::new(HashSet::new()),
+            streak_first: AtomicBool::new(streak_first),
             started_at: now(),
         }
     }
@@ -494,6 +510,22 @@ impl Miner {
         Ok(streamer)
     }
 
+    pub fn streak_first(&self) -> bool {
+        self.streak_first.load(Ordering::Relaxed)
+    }
+
+    pub fn set_streak_first(&self, enabled: bool) {
+        self.streak_first.store(enabled, Ordering::Relaxed);
+        if let Err(e) = self.store.set_meta(STREAK_FIRST_KEY, if enabled { "1" } else { "0" }) {
+            warn!("Could not save the streak_first setting: {e:#}");
+        }
+        self.event(if enabled {
+            "Streams missing their watch streak are now watched first"
+        } else {
+            "Watch streaks no longer go ahead of everything else"
+        });
+    }
+
     /// Saves a new list order (channel ids, most important first). Channels not in `ids` keep
     /// their relative order after the given ones.
     pub fn reorder(&self, ids: &[String]) -> Result<()> {
@@ -664,7 +696,7 @@ impl Miner {
                 && st.stream.minute_watched < 7.0
         };
         // With `streak_first`, streams whose streak isn't earned yet go ahead of everything else.
-        if self.config.streak_first {
+        if self.streak_first() {
             candidates
                 .iter()
                 .filter(|s| streak_missing(s))
