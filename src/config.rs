@@ -104,6 +104,9 @@ pub struct Config {
     pub username: String,
     pub claim_drops_startup: bool,
     pub priority: Vec<Priority>,
+    /// Streams whose watch streak isn't earned yet always get a watch slot first,
+    /// ahead of prioritized channels and `priority`.
+    pub streak_first: bool,
     pub followers: bool,
     pub followers_order: FollowersOrder,
     /// Only read once, to import into the database.
@@ -120,6 +123,7 @@ impl Default for Config {
             username: String::new(),
             claim_drops_startup: false,
             priority: vec![Priority::Streak, Priority::Drops, Priority::Order],
+            streak_first: false,
             followers: false,
             followers_order: FollowersOrder::Asc,
             blacklist: Vec::new(),

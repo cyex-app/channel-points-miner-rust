@@ -79,6 +79,8 @@ docker run -d --name points-miner-rust --restart unless-stopped -p 5000:5000 -v 
   `SUBSCRIBED`, `POINTS_ASCENDING`, `POINTS_DESCENDING`
 - Prioritized channels (star in the UI, or `prioritize = true` per channel) always get a watch slot when
   live, ahead of the `priority` rules, e.g. to build up watch time for a badge
+- `streak_first = true` puts streams whose watch streak isn't earned yet ahead of everything, even starred
+  channels, until the streak is claimed
 - Claims bonus chests and moments, joins raids, keeps watch streaks
 - Drop campaigns: tracks progress and claims drops automatically (`claim_drops_startup` claims the inventory on start)
 - IRC chat presence (`ALWAYS` / `NEVER` / `ONLINE` / `OFFLINE`)

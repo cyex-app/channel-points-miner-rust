@@ -18,6 +18,10 @@ claim_drops_startup = false
 # ORDER, STREAK, DROPS, SUBSCRIBED, POINTS_ASCENDING, POINTS_DESCENDING
 priority = ["STREAK", "DROPS", "ORDER"]
 
+# Watch streaks first: streams where the streak isn't earned yet always take a watch slot first,
+# ahead of prioritized (starred) channels and `priority`, until the streak is claimed.
+streak_first = false
+
 # Also mine every channel you follow. New follows are added to the end of the list on each start.
 # Channels removed in the web UI are blacklisted so they don't come back; `blacklist` here is only
 # imported on the first start, like `streamers`.

@@ -653,12 +653,28 @@ impl Miner {
                 selected.push(s.clone());
             }
         };
+        let now = now();
+        // Watch streak: be there for at least ~7 minutes of a stream that started
+        // more than 30 minutes after the previous one ended.
+        let streak_missing = |s: &Arc<Streamer>| {
+            let st = s.state();
+            s.settings.watch_streak
+                && st.stream.watch_streak_missing
+                && (st.offline_at == 0.0 || (now - st.offline_at) / 60.0 > 30.0)
+                && st.stream.minute_watched < 7.0
+        };
+        // With `streak_first`, streams whose streak isn't earned yet go ahead of everything else.
+        if self.config.streak_first {
+            candidates
+                .iter()
+                .filter(|s| streak_missing(s))
+                .for_each(|s| take(s, &mut selected));
+        }
         // Prioritized channels come first, in list order, ahead of the `priority` rules.
         candidates
             .iter()
             .filter(|s| s.state().prioritized)
             .for_each(|s| take(s, &mut selected));
-        let now = now();
         for priority in &self.config.priority {
             if selected.len() >= MAX_WATCHING {
                 break;
@@ -676,17 +692,9 @@ impl Miner {
                     }
                     sorted.into_iter().for_each(|(_, s)| take(s, &mut selected));
                 }
-                // Watch streak: be there for at least ~7 minutes of a stream that started
-                // more than 30 minutes after the previous one ended.
                 Priority::Streak => candidates
                     .iter()
-                    .filter(|s| {
-                        let st = s.state();
-                        s.settings.watch_streak
-                            && st.stream.watch_streak_missing
-                            && (st.offline_at == 0.0 || (now - st.offline_at) / 60.0 > 30.0)
-                            && st.stream.minute_watched < 7.0
-                    })
+                    .filter(|s| streak_missing(s))
                     .for_each(|s| take(s, &mut selected)),
                 Priority::Drops => candidates
                     .iter()
