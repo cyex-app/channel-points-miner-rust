@@ -70,6 +70,8 @@
   #channels.locked .grip { display: none; }
   .head-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
   button.toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  .header-right { display: flex; align-items: center; gap: 10px; }
+  .badge.paused { background: var(--danger); color: #fff; margin-left: 0; }
   button.handle { background: transparent; color: var(--muted); border: 0; padding: 2px 4px; font-size: 16px; line-height: 1.2;
     font-weight: 400; cursor: grab; touch-action: none; border-radius: 6px; }
   button.handle:hover, button.handle:focus-visible { color: var(--text); background: var(--row-hover); }
@@ -104,7 +106,11 @@
 <main>
   <header>
     <h1>Points Miner</h1>
-    <span id="user" class="muted">connecting…</span>
+    <div class="header-right">
+      <span id="user" class="muted">connecting…</span>
+      <button class="secondary lock" id="pause-btn" type="button" hidden
+        title="While paused nothing is watched, chats are left and no bonuses, drops or raids are claimed">⏸ Pause</button>
+    </div>
   </header>
 
   <section id="auth" class="panel login" hidden>
@@ -203,6 +209,7 @@ function showAuth() {
     $("new-token").hidden = true;
     $("auth").hidden = false;
     $("user").textContent = "locked";
+    $("pause-btn").hidden = true;
     $("auth-token").focus();
   }
 }
@@ -312,6 +319,7 @@ function render(st) {
     $("dashboard").hidden = true;
     $("login").hidden = false;
     $("user").textContent = "not logged in";
+    $("pause-btn").hidden = true;
     const p = st.login_prompt;
     $("login").innerHTML = p
       ? `<div>Open <a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.url)}</a> and enter this code:</div>
@@ -322,7 +330,11 @@ function render(st) {
   }
   $("login").hidden = true;
   $("dashboard").hidden = false;
-  $("user").textContent = "Mining as " + st.user;
+  $("user").innerHTML = st.paused
+    ? `<span class="badge paused">paused</span> ${esc(st.user)}`
+    : "Mining as " + esc(st.user);
+  $("pause-btn").hidden = false;
+  if (!$("pause-btn").disabled) renderPaused(st.paused);
   $("s-channels").textContent = st.streamers.length;
   $("s-live").textContent = st.streamers.filter((s) => s.online).length;
   $("s-points").textContent = fmt(st.streamers.reduce((a, s) => a + s.points, 0));
@@ -582,6 +594,29 @@ $("streak-btn").addEventListener("click", async () => {
     });
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Update failed");
     renderStreakFirst(enabled);
+  } catch (e) {
+    $("add-msg").className = "msg err"; $("add-msg").textContent = e.message;
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+});
+
+function renderPaused(paused) {
+  const btn = $("pause-btn");
+  btn.dataset.paused = String(paused);
+  btn.textContent = paused ? "▶ Resume" : "⏸ Pause";
+}
+$("pause-btn").addEventListener("click", async () => {
+  const btn = $("pause-btn");
+  const paused = btn.dataset.paused !== "true";
+  btn.disabled = true;
+  try {
+    const res = await api("api/settings/paused", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paused }),
+    });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Update failed");
+    renderPaused(paused);
   } catch (e) {
     $("add-msg").className = "msg err"; $("add-msg").textContent = e.message;
   } finally {

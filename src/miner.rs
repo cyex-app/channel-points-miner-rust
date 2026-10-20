@@ -32,6 +32,8 @@ use crate::{
 const MAX_WATCHING: usize = 2;
 /// `meta` key for the `streak_first` setting changed in the web UI, which overrides config.toml.
 const STREAK_FIRST_KEY: &str = "streak_first";
+/// `meta` key for whether mining was paused in the web UI.
+const PAUSED_KEY: &str = "paused";
 /// Recent events kept for web UI clients that connect later.
 const MAX_EVENTS: usize = 50;
 
@@ -54,6 +56,9 @@ pub struct Miner {
     adding: Mutex<HashSet<String>>,
     /// `streak_first` from config.toml, unless it was changed in the web UI.
     streak_first: AtomicBool,
+    /// While paused nothing is watched, chats are left and nothing is claimed. PubSub stays
+    /// connected so balances and live status stay current in the web UI.
+    paused: AtomicBool,
     pub started_at: f64,
 }
 
@@ -78,6 +83,16 @@ impl Miner {
                 config.streak_first
             }
         };
+        let paused = match store.meta(PAUSED_KEY) {
+            Ok(v) => v.as_deref() == Some("1"),
+            Err(e) => {
+                warn!("Could not read the paused setting: {e:#}");
+                false
+            }
+        };
+        if paused {
+            info!("Mining is paused, resume it in the web UI");
+        }
         Self {
             twitch,
             config,
@@ -89,6 +104,7 @@ impl Miner {
             events_tx: broadcast::channel(256).0,
             adding: Mutex::new(HashSet::new()),
             streak_first: AtomicBool::new(streak_first),
+            paused: AtomicBool::new(paused),
             started_at: now(),
         }
     }
@@ -526,6 +542,26 @@ impl Miner {
         });
     }
 
+    pub fn paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        if self.paused.swap(paused, Ordering::Relaxed) == paused {
+            return;
+        }
+        if let Err(e) = self.store.set_meta(PAUSED_KEY, if paused { "1" } else { "0" }) {
+            warn!("Could not save the paused setting: {e:#}");
+        }
+        for s in self.streamers() {
+            if paused {
+                s.state().watching = false;
+            }
+            self.update_chat(&s);
+        }
+        self.event(if paused { "Mining paused" } else { "Mining resumed" });
+    }
+
     /// Saves a new list order (channel ids, most important first). Channels not in `ids` keep
     /// their relative order after the given ones.
     pub fn reorder(&self, ids: &[String]) -> Result<()> {
@@ -588,12 +624,13 @@ impl Miner {
 
     fn update_chat(&self, streamer: &Streamer) {
         let online = streamer.state().is_online;
-        let join = match streamer.settings.chat {
-            ChatPresence::Always => true,
-            ChatPresence::Never => false,
-            ChatPresence::Online => online,
-            ChatPresence::Offline => !online,
-        };
+        let join = !self.paused()
+            && match streamer.settings.chat {
+                ChatPresence::Always => true,
+                ChatPresence::Never => false,
+                ChatPresence::Online => online,
+                ChatPresence::Offline => !online,
+            };
         if join {
             self.chat.join(&streamer.username);
         } else {
@@ -670,6 +707,9 @@ impl Miner {
     }
 
     async fn claim_bonus(&self, streamer: &Streamer, claim_id: &str) {
+        if self.paused() {
+            return;
+        }
         self.event(format!("Claiming the bonus for {streamer}!"));
         if let Err(e) = self.twitch.claim_bonus(&streamer.channel_id, claim_id).await {
             warn!("Bonus claim failed for {}: {e:#}", streamer.username);
@@ -748,6 +788,10 @@ impl Miner {
 
     async fn watch_loop(self: Arc<Self>) {
         loop {
+            if self.paused() {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
             let streamers = self.streamers();
             let now = now();
             let candidates: Vec<_> = streamers
@@ -776,6 +820,9 @@ impl Miner {
             }
 
             for s in &watching {
+                if self.paused() {
+                    break;
+                }
                 let next = Instant::now() + Duration::from_secs_f64(20.0 / watching.len() as f64);
                 if let Err(e) = self.watch_once(s).await {
                     debug!("Minute watched failed for {}: {e:#}", s.username);
@@ -841,6 +888,9 @@ impl Miner {
     // === Drops === //
 
     async fn claim_drop(&self, drop: &Drop) -> bool {
+        if self.paused() {
+            return false;
+        }
         let Some(instance_id) = &drop.drop_instance_id else {
             return false;
         };
@@ -849,6 +899,9 @@ impl Miner {
     }
 
     pub async fn claim_all_drops_from_inventory(&self) {
+        if self.paused() {
+            return;
+        }
         let inventory = match self.twitch.inventory().await {
             Ok(inv) => inv,
             Err(e) => return warn!("Could not load the drops inventory: {e:#}"),
@@ -921,7 +974,7 @@ impl Miner {
         let mut last_refresh = 0.0;
         loop {
             let streamers = self.streamers();
-            if streamers.iter().any(|s| s.settings.claim_drops) {
+            if !self.paused() && streamers.iter().any(|s| s.settings.claim_drops) {
                 if now() - last_refresh > 30.0 * 60.0 {
                     last_refresh = now();
                     self.claim_all_drops_from_inventory().await;
@@ -1013,7 +1066,7 @@ impl Miner {
                 let (Some(raid_id), Some(target)) = (raid["id"].as_str(), raid["target_login"].as_str()) else {
                     return;
                 };
-                if !streamer.settings.follow_raid {
+                if !streamer.settings.follow_raid || self.paused() {
                     return;
                 }
                 {
@@ -1032,7 +1085,8 @@ impl Miner {
                 });
             }
             ("community-moments-channel-v1", "active") => {
-                if let (true, Some(moment_id)) = (streamer.settings.claim_moments, data["moment_id"].as_str()) {
+                let claim = streamer.settings.claim_moments && !self.paused();
+                if let (true, Some(moment_id)) = (claim, data["moment_id"].as_str()) {
                     self.event(format!("Claiming the moment for {streamer}!"));
                     let (miner, moment_id) = (self.clone(), moment_id.to_string());
                     tokio::spawn(async move {

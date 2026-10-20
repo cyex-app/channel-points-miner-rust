@@ -82,6 +82,8 @@ docker run -d --name points-miner-rust --restart unless-stopped -p 5000:5000 -v 
 - `streak_first = true` puts streams whose watch streak isn't earned yet ahead of everything, even starred
   channels, until the streak is claimed. It can also be switched on and off in the web UI (🔥 Streaks first);
   the web UI setting is saved in the database and overrides the config from then on
+- Pause and resume mining from the web UI (⏸ Pause next to your name). While paused nothing is watched, chats are
+  left and no bonuses, drops, moments or raids are claimed; the pause is saved in the database and survives restarts
 - Claims bonus chests and moments, joins raids, keeps watch streaks
 - Drop campaigns: tracks progress and claims drops automatically (`claim_drops_startup` claims the inventory on start)
 - IRC chat presence (`ALWAYS` / `NEVER` / `ONLINE` / `OFFLINE`)
